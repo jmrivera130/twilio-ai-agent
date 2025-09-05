@@ -1,0 +1,502 @@
+AI Voice Agent Guide: Foreclosure Inbound Call
+Flow
+Agent Introduction
+When a homeowner in foreclosure calls in (often after receiving a letter or door visit), the AI agent should
+begin  with  a  warm,  professional  greeting  and  an  immediate  display  of  empathy.  The  agent  should
+introduce themselves and the organization, making it clear they are calling to help, not to pressure. Key
+elements of the introduction include: 
+Friendly Greeting: “Hello, thank you for calling [Your Team Name], this is [Agent Name].” Use a
+calm tone to set the caller at ease.
+Context & Recognition: Acknowledge why they might be calling. For example, “I understand you
+received a letter from us about your home. I’m here to answer any questions and help in any way I can.”
+This shows you’re aware of the outreach and ready to assist.
+Empathy and Reassurance: Lead with empathy – recognize that foreclosure is a difficult situation.
+For instance, “I know facing foreclosure can feel overwhelming, and you’re not alone in this. Our team’s
+mission is to help homeowners like you find a way out.” This builds trust from the start. 
+Mission Statement (Early in Call): Clearly and concisely state the group’s purpose: helping homeowners
+avoid foreclosure. Highlight the available solutions your group can facilitate, such as loan modifications,
+short sales, or even a quick cash purchase of the home. For example: 
+“Our goal is to help you  avoid foreclosure and keep it off your record. We explore  all possible
+options – whether it’s negotiating a loan modification with your lender, arranging a short sale if
+you prefer to sell, or even providing a cash offer to buy the property if that makes sense for you
+. We’re here to figure out the best solution for your situation.”
+This  introduction  assures  the  caller  that  the  agent  is  focused  on  solutions,  not  sales,  echoing  the
+empathetic, solution-oriented approach recommended for foreclosure outreach. After the introduction,
+listen carefully to the caller’s tone and initial response. Based on their reaction, the call can branch in two
+primary directions: - If the caller sounds upset, angry, or immediately asks to “opt out” of further contact,
+proceed to  Opt-Out Handling. - If the caller is calm or interested in learning more, proceed to  Pre-
+Screening Questions to gather information, before moving on to scheduling help.
+(Note: Always let the caller speak and explain their purpose in calling. Avoid interrupting. The introduction above
+can be adjusted in length based on whether the caller jumps in with questions or concerns.)
+Opt-Out Handling (Upset or Uninterested Callers)
+Not all homeowners will welcome the call – some may be upset at receiving outreach or strongly skeptical
+of help offers. The AI agent must remain calm, respectful, and accommodating, especially with callers
+• 
+• 
+• 
+1
+1
+who demand to be removed from contact lists. The goal in this branch is to defuse the situation, affirm
+the caller’s wishes, and still leave a professional, helpful impression. Key steps for opt-out scenarios:
+1. Apologize and Acknowledge: Begin by validating their feelings. “I understand that our reaching
+out has upset you, and I’m truly sorry for any inconvenience.” A sincere apology can help an angry caller
+feel heard. Acknowledge their request directly (e.g., “I hear that you want to opt out of further
+contact.”). This shows respect for their autonomy.
+2. Briefly Restate Mission (if possible): In one sentence, clarify that your intent was to help, not
+harass. “Our intention was only to offer help to avoid foreclosure, through options like loan mods or sales
+– but I absolutely respect your decision.” Keep this very concise to avoid sounding like a sales pitch.
+Even a skeptical caller may appreciate a quick reminder that you are a legitimate foreclosure relief
+team, not a scammer. If the caller is extremely angry, you may skip this step to avoid prolonging
+the call – use judgment based on their tone.
+3. Confirm Removal from Contact List: Assure the caller that you will honor their opt-out request. 
+“I will make sure to remove you from our contact list immediately, so you won’t receive any more calls or
+letters from us.” It’s important the agent actually flags this number internally as “Do Not Contact.”
+4. Leave Door Open (Friendly Closure): End on a polite note that keeps future help available
+without pressuring. For example: “Thank you for your time, and again, I apologize for the hassle. If you
+ever need assistance with avoiding foreclosure down the line, please know our door is open and we’re here
+to help. Take care.”
+The agent should then gently conclude the call. No further attempts to persuade should be made – the
+emphasis is on respect and compliance. By clearly stating the mission and then honoring the opt-out, the
+agent conveys professionalism. Even upset callers who aren’t interested may calm down when they feel
+their wishes are respected. This approach can turn a hostile interaction into a neutral or even positive one
+by the end, and it leaves a good impression should the homeowner reconsider later. 
+(Example Opt-Out Dialogue – Caller: “I’m sick of these letters. Take me off your list!” Agent: “I’m very sorry for the
+inconvenience. I completely understand – I will remove you from our list right away. Our only aim was to help you
+avoid foreclosure through solutions like loan modification or a sale, but I respect that you’re not interested
+.
+You won’t receive further contact from us. If you ever need help in the future, we’ll be here. Thank you for taking
+the time to call, and have a good day.”)
+Interest-Based Pre-Screening Questions (For Interested Callers)
+If the caller indicates interest in hearing about options or generally sounds open to discussion, the AI agent
+should smoothly transition into a brief information-gathering phase. The purpose of these questions is to
+gather key property and situation details that are not readily available from the Notice of Default (NOD), in
+order to better assess the homeowner’s situation. All questions must be concise, respectful, and relevant
+– the agent should avoid anything that feels intrusive or too personal. 
+Before asking, get permission and frame the reason for the questions: 
+“To help our team understand your situation a little better and recommend the right options, I’d
+like to ask just a few quick questions about your property. We won’t touch on private financial info
+– just some basics. Would that be okay?”
+• 
+• 
+• 
+• 
+1
+2
+If the caller agrees, proceed with the following  screening questions, pausing after each to listen and
+acknowledge  the  answer.  These  cover  the  crucial  areas  of  concern  beyond  what  the  NOD  document
+provides:
+1. Additional Liens or Loans: “Besides your primary mortgage, do you know if there are any other liens
+or loans on the property?” (Examples to clarify could include a second mortgage, HELOC, or liens
+such as tax liens or HOA liens.) Explain why this matters, in a reassuring tone: “We ask because any 
+other liens – like a second mortgage or tax lien – could affect the strategy we use to help you
+. It’s
+totally fine if you’re not sure; any detail you do know helps.” This question uncovers if there are
+additional debts secured by the property. Knowing about junior liens or judgments is important
+since all liens would need to be addressed in a resolution (unlike in a foreclosure auction where
+junior liens might be wiped, pre-foreclosure solutions require dealing with them)
+. For example, if
+there’s a second mortgage or an IRS tax lien, the team may need to negotiate with those lienholders
+as well. 
+2. Occupancy Status: “Is the home currently owner-occupied, or is someone else (like a tenant or relative)
+living there right now?” This question is to gently determine if the caller (homeowner) is living in the
+property or if it’s rented out. It provides insight into their circumstances: An owner-occupied home
+might indicate the owner wants to keep the home if possible, whereas a tenant-occupied property
+might mean the homeowner is more open to selling (since they’re not living there) or could face
+issues with tenants in a foreclosure. It also alerts the team if there would be tenant rights to
+consider. Keep the tone neutral and add a quick rationale if needed: “Knowing whether you’re living
+there or if tenants are there helps us tailor the right solution – some programs are for primary residences,
+for example.”
+3. Ownership and Title Status (Probate or Disputes): “Just to make sure we understand the
+ownership: Are you the only owner on the title of the property? For instance, some folks co-own with family,
+or sometimes a property might be in a trust or inherited… Is there any estate or probate situation affecting
+the house?” This question is asked carefully, as it can be sensitive. The goal is to find out if the
+homeowner has full authority to make decisions or if, for example, the property is tied up in a legal
+process due to an owner’s death or family dispute. If the caller mentions a recent death or that
+they’re an heir, express sympathy (“I’m very sorry to hear that.”) and note that this can complicate
+things slightly. Explain in simple terms: “The reason I ask is, if a property is in probate or held in an
+estate, the process to resolve a foreclosure can involve some extra legal steps
+. It’s absolutely
+something we can navigate – we just like to know upfront so we handle everything properly.” Indeed, if
+the homeowner passed away or title is under an estate, the foreclosure process may pause until a
+probate court appoints a representative, and any solution (loan mod, sale, etc.) must involve that
+representative
+. By identifying this early, your team can prepare accordingly.
+4. (Optional) Foreclosure Timeline Check: “Have you received a notice of a sale date or auction date
+for the foreclosure yet?” (Or “Has the bank or trustee given a date for a foreclosure sale?”) This question is
+optional but very useful. Many homeowners in NOD stage might not have a sale date scheduled yet
+(that usually comes with a Notice of Trustee Sale a few months after the NOD). If the caller knows a
+sale date, it indicates the situation is urgent and time is short. Knowing the timeline helps prioritize
+actions (e.g., if an auction is two weeks away, a different sense of urgency is needed). If the caller
+isn’t sure, that’s fine – the agent can likely find that out from public records or the NOD document
+later. If the caller does provide a date, respond with reassurance: “Thanks for letting me know. That
+timeline will help us act quickly – there are still steps we can take before that date.”
+For each question above, the agent should  actively listen to the caller’s answer and respond with brief
+acknowledgments or empathy. Avoid reaction that sounds judgmental or overly concerned – even if the
+• 
+2
+2
+• 
+• 
+3
+4
+5
+4
+• 
+3
+answers reveal a complex situation (for example, “Yes, I have tax liens and my mother’s estate is still in
+probate”), stay positive and supportive: “Got it. These details are really helpful – thank you. It sounds like there’s
+a bit to sort out, but don’t worry, we have experience handling these situations.” The agent might take notes
+(internally) on these answers to pass to the relief team later.
+Do NOT ask for sensitive personal financial details (income, credit, account numbers, etc.) in this initial
+call – those are not only private, but also typically handled by counselors or specialists later if needed. The
+focus is strictly on property-related facts that help in evaluating foreclosure solutions. Each question is
+framed as being for the benefit of the homeowner (so the team can better help them), keeping the tone
+helpful and non-intrusive. 
+By the end of this Q&A, the agent will have a clearer picture of the case: Are there multiple liens to deal
+with? Is the homeowner living in the house? Any legal title hurdles? With this information, the agent can
+more effectively set up the next steps. Once the key questions are covered (don’t ask more than these few –
+respect the caller’s time and patience),  transition to offering a meeting/appointment to delve deeper
+into solutions.
+(The agent should also be prepared: often a Notice of Default provides some baseline info like the defaulted loan
+amount, lender, and possibly if it’s a first or second mortgage. The AI could pull data from the NOD if integrated.
+But the above questions cover critical gaps: NODs won’t list other liens or occupancy or probate issues.)
+Appointment Booking Logic (Scheduling a Relief Consultation)
+After  the  caller  has  answered  the  screening  questions  (or  if  they  indicated  interest  without  needing
+questions),  the  agent  should  summarize  and  move  toward  scheduling  an  appointment with  the
+foreclosure relief team. This portion of the call is crucial for converting interest into action. The AI agent’s
+objectives here are to  confirm the caller’s interest, explain the next step (meeting), and schedule a
+convenient time. 
+Steps and best practices for booking the meeting:
+1. Express Appreciation and Recap: Thank the caller for sharing information and reiterate your
+desire to help. For example: “Thank you for answering those questions – it really helps. From what you’ve
+shared, I’m confident we can figure out some options to help you avoid foreclosure.” You might briefly
+recap one key point positively: “It sounds like aside from your main mortgage, there’s also a small tax
+lien on the property – that’s something we can definitely look into further.” This shows you listened and it
+sets the stage for the next step.
+2. Introduce the Free Consultation: Clearly describe what you are offering to schedule. Use inviting
+language and emphasize it’s free and aimed at helping. For instance: “The next step we usually
+recommend is a free personal consultation with our foreclosure relief team. They can dive deeper into your
+situation and walk you through specific solutions – whether it’s how to approach your lender for a mod or
+what a sale might look like. Would you be interested in setting up a meeting with them?” Make it sound
+like a helpful service (which it is), not a sales trap. Mention it’s no obligation and no cost. This
+encourages the homeowner to agree without feeling pressured.
+3. Handle Questions or Hesitation: The caller might ask who is in the meeting or what it involves.
+Have a concise answer ready: “Our foreclosure relief team includes experienced professionals – for
+example, a housing counselor or loan specialist and a real estate expert. They’ll review your foreclosure
+• 
+• 
+• 
+4
+status and discuss the pros and cons of each option (loan mod, repayment plan, short sale, etc.) given your
+situation. It’s basically an educational session for you, and they’ll answer all your questions. Again, it’s
+completely free.” If the caller is hesitant about scheduling, offer flexibility: “If you’re not ready to commit
+to a meeting right now, that’s okay – we can also send you some information or give you a call in a few
+days to see how you’re feeling. Whatever you prefer.” However, if they seem interested, proceed to
+scheduling.
+4. Schedule the Date/Time via Cal.com (or your booking system): Once the caller agrees to a
+meeting, move into scheduling mode. Use a friendly, step-by-step approach to find a convenient
+time. For example: 
+“Great! Let’s find a time that works for you. Our team is available for consultations most weekdays. Do you
+have a preference for a morning, afternoon, or evening meeting?” Let the caller respond, then narrow
+down: “Alright, how about we look at Wednesday afternoon? We have a slot around 2:00 PM – would that
+work for you?”
+If that doesn’t work, offer an alternative: “No problem. We also have Thursday at 6:00 PM open if an
+evening is better, or Friday morning.” Be accommodating and patient as the caller checks their
+schedule. This feels like a natural scheduling conversation.
+Once a time is agreed, confirm the details clearly: “Okay, I’ve booked you for Wednesday, [Date], at
+2:00 PM with our foreclosure help team.” Mention the format of the meeting: “They can meet with you
+by phone or video call, whichever you prefer. Typically it’s a phone call unless you’d like a Zoom meeting.”
+(Adapt this to your actual practice; if it’s in-person, state the location details instead.)
+5. Collect/Confirm Contact Info for the Meeting: Ensure you have the right contact information to
+send a calendar invite or reminder. “What’s the best email address to send you the meeting confirmation
+and details?” (If you already have their email from prior outreach, confirm it.) Also confirm their
+phone number if needed: “And just to double-check, we’ll call you at this number ending in 1234 for the
+meeting – is that correct?” Accurate contact info is important for Cal.com invites or any reminders.
+6. End on an Encouraging Note: Wrap up the call by reinforcing that they’ve made a positive step. 
+“We’re all set for your appointment on Wednesday at 2 PM. I’m really glad you reached out – our team will
+be ready to help you explore those options and find the best solution. In the meantime, if you have any
+questions or if anything changes, you can call us anytime.” Thank them again for speaking with you. A
+friendly closing: “Take care, and we look forward to speaking with you on Wednesday!” gives the call a
+warm end.
+After hanging up, the AI should mark the conversation appropriately in the system: the caller is “Interested
+– scheduled for consult on [date]”, include notes from the pre-screen (e.g., has second lien, owner
+occupied,  etc.),  so  the  human  team  is  prepared.  The  Cal.com  integration would  handle  sending  a
+confirmation email/text to the caller with meeting details (though we’re not detailing technical integration
+here).
+If Caller Is Not Ready to Schedule: In some cases, a homeowner might be interested in information but
+not ready to commit to a meeting. They might say, “I need to think about it” or “Can you send me info first?”
+For  these  cases,  the  agent  should  avoid  pressuring.  Instead,  offer  to  follow  up  later:  “Of  course.  I
+understand this is a lot to consider. I can email you some information about our services and the options we
+discussed. Would it be okay if I give you a call in a few days to check in? I promise no pressure – just to see if you
+have any questions.” If they agree, schedule a follow-up call task internally. If they decline even that, simply
+let them know how to reach you if they change their mind. And mark them as not interested for now (and
+do not continue to proactively reach out beyond what they agreed to). This aligns with the earlier
+directive: if not interested, tag as do-not-contact but leave the door open politely.
+• 
+• 
+• 
+• 
+• 
+• 
+5
+Throughout the booking phase, maintain that calm, helpful demeanor. The homeowner should feel like
+they’re talking to a supportive assistant who is organizing help with them, not pushing them into a sales
+funnel. The mention of a team and scheduling adds a sense of legitimacy (it shows you have a formal
+process and a real team). By the end, the caller should feel relieved that a concrete next step is in place,
+and hopefully optimistic that they’ll get help to resolve their foreclosure challenge.
+Recommended Property Intelligence Sources for Foreclosure Cases
+(This section is a brief research-backed overview for the team’s reference – detailing what property information is
+typically needed to fully assess a foreclosure case beyond the Notice of Default, and where to find that data. It can
+help the AI agent’s knowledge base or the human team’s preparation before/after the call.)
+A recorded Notice of Default (NOD) provides the basic facts of the foreclosure: the defaulted loan, the
+borrower and lender names, the amount in arrears, and the initiation of the foreclosure process. However,
+to  properly assess a foreclosure case and craft solutions, additional property information is often
+required beyond what the NOD contains. Below are key types of information and reliable sources (public
+and paid) to obtain them:
+Full Lien and Title History: It’s crucial to know all encumbrances on the property, not just the
+mortgage in foreclosure. This includes secondary mortgages, home equity lines (HELOCs), tax
+liens, judgment liens, or Homeowners Association (HOA) liens. Any buyer or negotiator will need
+to deal with these, since before an auction, all liens are still in force and must be resolved or
+negotiated
+. A title search or property ownership & encumbrance report will list all recorded
+liens. Reliable sources**:
+County Recorder’s Office: Public records where deeds of trust/mortgages, liens, and NODs/Notices of
+Sale are recorded. Many counties have online databases to search by property or owner name. This
+is the direct source, though it may require pulling documents individually (often for a small fee).
+First American DataTree®: A professional property data platform that provides comprehensive title
+reports and recorded document images. DataTree aggregates deeds, mortgages, foreclosure
+notices, assignments, releases – with coverage across 100% of U.S. properties (99%+ of deeds and
+foreclosures)
+. Users can pull an Ownership & Encumbrance (O&E) report or an Open Liens
+report to see all outstanding liens on the property
+. DataTree’s search allows filtering by open lien
+status and shows foreclosure status as well
+. It’s a paid service used by real estate pros, but it’s
+very thorough.
+Title Companies / Title Plant Systems: In many states, title companies have internal databases (title
+plants) that mirror recorder data. If you have an industry contact, they can often provide a property
+profile with liens. (In some places, however, providing foreclosure lists or detailed profiles to non-
+clients is restricted
+.)
+PropStream: A real estate investor platform that also pulls data from county records. PropStream
+provides  mortgage information and involuntary lien data on properties
+. For example,
+PropStream can show if a property has a second mortgage or a tax lien (under “involuntary liens”),
+alongside the foreclosure status and default amount. It’s a subscription service but widely used for
+quick lien and equity checks on distressed properties.
+• 
+2
+• 
+• 
+6
+7
+8
+• 
+9
+• 
+10
+11
+6
+Property Tax Status and Tax Defaults: Property taxes are a critical piece of the puzzle. Unpaid
+property taxes can lead to tax liens or even tax foreclosure, and they remain a lien on the property
+that typically survives a mortgage foreclosure if not addressed
+. It’s important to check:
+Are property taxes current or in default? How much is owed if delinquent?
+Any tax sale proceedings? (Less common, but worth verifying.)
+Reliable sources: -  County Treasurer/Tax Collector’s Office: Most counties allow the public (with the parcel
+number or address) to check the tax payment status. This might be an online portal showing if taxes are
+unpaid and for which years. Some counties list if a property is in a tax default status or on a tax sale list. -
+PropertyRadar: A specialized foreclosure and property data service popular in states like California, Arizona,
+etc. PropertyRadar not only tracks foreclosure filings, but also synchronizes with county tax assessor
+records and updates tax delinquencies
+. In PropertyRadar, one can often see if a property has
+delinquent  property  taxes outstanding  (it’s  one  of  the  data  points  provided)
+.  This  tool
+essentially aggregates data from courthouses (NODs/NTS) and tax records, giving a fuller picture in
+one place. It is a paid service but highly regarded for up-to-date foreclosure tracking and data depth.
+-  PropStream: PropStream includes  tax information as well – it will list the annual tax assessed and
+sometimes indicate if there is a tax lien or delinquency (if that data is available via county). It may
+not  be  as  explicit  as  PropertyRadar  for  tax  delinquency,  but  it’s  another  checkpoint.  -  County
+Assessor’s Database: The assessor’s records can confirm the owner of record, the assessed value, and
+possibly mailing address** of the owner. If the mailing address for the owner is different from the property,
+for example, that tells you the owner might live elsewhere (which could hint the property is rented out).
+Some assessor sites also flag if a property is tax-defaulted or provide a link to tax payment status.
+Probate, Ownership, and Legal Status: If the property owner is deceased or there are ownership
+disputes (e.g., divorce or inheritance issues), it’s important to verify the legal owner and any
+probate case:
+County Probate Court Records: If you suspect a probate (say the owner died and heirs are involved),
+checking the county court’s online case search for the owner’s name could reveal a probate case.
+This is public record in many jurisdictions. The probate case can show if an executor/personal
+representative has been appointed – which is the person your team would need to work with. As
+noted, a foreclosure involving a deceased owner will require dealing with the estate’s representative
+.
+Obituaries or Legacy.com: In some cases, investors or helpers search obituaries to confirm if an owner
+has passed (if mail is returned or neighbors say the owner died). This is more of a manual research
+step.
+Title Records (again): The deed can show how title is held (e.g., “John Smith as Trustee of the 2005
+Smith Family Trust” – indicating a trust ownership, or “Jane Doe, deceased” if an affidavit of death
+was recorded). Any recorded affidavit of death, divorce decrees, or lis pendens could be relevant.
+DataTree or recorder’s search can uncover those.
+DataTree and PropStream: These can sometimes flag if an owner is marked as deceased in their data
+(PropStream, for instance, has filters for properties with “senior owners” or even recent death, via
+obituary data, though it’s not always accurate). DataTree won’t directly give you probate cases, but
+you can often identify if title changed due to death (and it can provide the vesting deed info under
+ownership history).
+• 
+12
+• 
+• 
+13
+14
+15
+16
+• 
+• 
+5
+• 
+• 
+• 
+7
+Foreclosure  Trustee  Filings  &  Status: Beyond  the  initial  NOD,  one  should  track  subsequent
+foreclosure notices:
+Notice of Trustee’s Sale (NTS): sets the auction date. This is recorded at the county recorder and
+often published in newspapers. It’s crucial to know if and when this has been filed, because it
+contains the scheduled sale date and auction details. Public sources: county recorder (look for a
+Notice of Sale under the property name), or trustee’s sales websites (some trustees list sales online). 
+Paid sources: PropertyRadar shines here – it tracks a property through NOD to NTS to actual auction
+outcomes, updating status in near real-time
+. PropStream also lists if a property is in pre-
+foreclosure vs heading to auction (though it may not update as quickly on auction postponements or
+cancellations).
+Trustee/Attorney Websites: In some states, the entity handling the foreclosure (trustee or sheriff)
+has a site where you can search for the property or case number to see if an auction is scheduled or
+postponed.
+PropertyRadar & PropStream: Both will label a property as in pre-foreclosure, in auction, or bank-
+owned if it went through sale. PropertyRadar specifically provides status like “NOD filed on X date,
+NTS filed on Y date, Auction on Z date (postponed or sold)” – very useful for a comprehensive view
+. PropStream’s “Foreclosure Details” might show the default recording date and sometimes the
+auction date if known
+.
+Property Condition & Market Data: While not explicitly asked in the question, for a complete
+assessment one might also gather:
+Property details (beds, baths, square footage, lot size, year built) – available via county assessor or
+Zillow. This helps in estimating value or considering a sale.
+Neighborhood comps or value estimates – e.g., Zillow’s Zestimate, or PropStream’s comparable
+sales tool. This isn’t about the foreclosure per se, but if considering a short sale or cash offer, you’d
+want to know the home’s approximate value vs the debt.
+Rental status (if tenant-occupied, what’s the rental market or are tenants likely cooperative –
+sometimes outreach to tenants occurs if owner is MIA, but that’s advanced).
+HOA status if in a condo or community – any HOA dues delinquent? (HOAs can foreclose or at least
+attach liens, as mentioned). This info might be uncovered by asking the owner or seeing an HOA lien
+in records. There are also HOA contact reports available (DataTree lists an HOA contact report)
+.
+Summary of Recommended Sources: 
+County Assessor & Tax Collector (public websites): To confirm owner, mailing address, assessed
+values, and property tax payment status (delinquencies). Easy free check for occupancy clues and tax
+defaults.
+County Recorder / Clerk (public records): To obtain NOD, NTS, and any other liens or notices on
+record. Fundamental for official documents (usually small fee per document if not using an
+aggregator).
+PropertyRadar (paid): Excellent for foreclosure-specific leads and data, combining recorder info,
+assessor info, and tracking foreclosure stages in one interface
+. It can show notices, auction
+dates, tax delinquencies, equity, ownership, and more in one place
+. Useful for West Coast
+states and others it covers.
+• 
+• 
+17
+• 
+• 
+18
+10
+• 
+• 
+• 
+• 
+• 
+19
+7
+• 
+• 
+• 
+13
+15
+14
+8
+PropStream (paid): A nationwide property data tool with a broad feature set. Great for pulling up a
+property and seeing open mortgages, involuntary liens, MLS info, and foreclosure status
+. Also has built-in estimators and marketing tools. Good for an investor-style overview of the
+property’s financial profile.
+First American DataTree (paid): A professional-grade tool for deep property research, ideal for
+pulling official reports and documents. Provides comprehensive title data (ownership history,
+open liens, judgments, releases) and lets you download recorded document images (like the
+actual NOD or mortgage documents)
+. DataTree is very reliable for due diligence – for example,
+one can order a Total View Report or Property Detail report to get a compiled view of property,
+owner, loans, transfers, etc., and even get plat maps or assesor maps
+. It’s often used by title
+companies, law firms, and serious investors.
+Others: There are other tools like PropertyShark, RealtyTrac, MLS databases, or local databases
+which can supplement, but the ones above are among the most trusted in foreclosure research. 
+PropertyRadar, PropStream, and DataTree were specifically noted because they are commonly
+used to gather a 360° view of a distressed property.
+Having this information helps the foreclosure relief team understand the full scope of the homeowner’s
+situation. For instance, knowing there’s a tax default or HOA lien in addition to the mortgage default lets the
+team prepare to address those (perhaps during a short sale negotiation all lienholders must be dealt with
+). Understanding if the owner is in probate will change the approach legally. These property intelligence
+sources ensure no surprises – such as finding out about a second loan or a pending tax auction at the last
+minute – which could derail a foreclosure prevention plan.
+In summary, beyond the NOD you’ll typically need to gather: the complete lien profile (mortgages, judgments,
+taxes, HOA), the occupancy/owner status, any legal ownership hurdles, and the foreclosure timeline. Utilizing
+public records and specialized data services like  County databases,  PropertyRadar,  PropStream, and
+DataTree will  equip  the  AI  agent  and  your  team  with  the  necessary  information  to  effectively  help
+homeowners avoid foreclosure with the right strategy
+. The combination of respectful, solution-
+focused conversation and solid property research is the key to guiding distressed homeowners toward a
+positive resolution. 
+Foreclosures, Loan Modifications, Deeds in Lieu of Foreclosure
+https://dewittlaw.com/foreclosure/3736/foreclosures-loan-modifications-short-sales-and-deeds-in-lieu-of-foreclosure/
+Pre-foreclosure Investing | PropertyRadar Help Center
+https://help.propertyradar.com/en/articles/1031207-pre-foreclosure-investing
+Foreclosure and Probate in Florida | What Happens to the House After Owner Dies
+https://www.hallandalelaw.com/foreclosure-and-probate-in-florida/
+Real Estate Property Research Tools | First American Data & Analytics
+https://dna.firstam.com/solutions/property-data/datatree-property-research
+PropertyRadar vs PropStream: Expert Review | Mashvisor
+https://www.mashvisor.com/blog/propertyradar-vs-propstream/
+How to Investigate Liens on Foreclosures | Zillow
+https://www.zillow.com/learn/due-diligence-investigate-property-liens/
+• 
+10
+11
+• 
+20
+21
+• 
+22
+13
+8
+1
+22
+2
+9
+13
+17
+18
+3
+4
+5
+6
+7
+8
+19
+20
+21
+10
+11
+14
+15
+16
+12
+9

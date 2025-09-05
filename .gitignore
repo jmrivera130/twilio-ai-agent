@@ -1,0 +1,9 @@
+venv/
+__pycache__/
+*.pyc
+.env
+knowledge_index.pklvenv/
+__pycache__/
+*.pyc
+.env
+knowledge_index.pkl

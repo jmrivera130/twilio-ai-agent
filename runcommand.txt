@@ -1,0 +1,4 @@
+cd C:\Users\scrib\twilio-ai-agent
+venv\Scripts\activate
+
+python app.py
