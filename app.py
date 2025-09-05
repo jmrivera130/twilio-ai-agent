@@ -1,163 +1,114 @@
+# app.py  (COMPLETE FILE - REPLACE YOURS)
+import os, time
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
 from openai import OpenAI
-from dotenv import load_dotenv
-import os
-import time
 
-import re
-from collections import defaultdict
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID")
 
-# simple per-call memory (lives only for the process life)
-PENDING_UTTERANCE = {}
-
-load_dotenv()
-api_key = os.getenv("OPENAI_API_KEY")
-assistant_id = os.getenv("CHLOE_ASSISTANT_ID")
-client = OpenAI(api_key=api_key)
-
+client = OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
 
+# ----------- Twilio entrypoints -----------
 @app.route("/voice", methods=["POST"])
 def voice():
     r = VoiceResponse()
-    # Faster recognition + let caller interrupt prompts
+    # Faster turn-taking: short timeout; keep prompt brief
     gather = r.gather(
         input="speech",
         action="/process",
         method="POST",
         speechTimeout="1",
-        language="en-US",
-        bargeIn="true"
+        language="en-US"
     )
-    # brief, welcoming prompt (shorter = less delay to next turn)
-    gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help you today?",
-               voice="Polly.Joanna", language="en-US")
+    gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help you today?")
     return Response(str(r), mimetype="text/xml")
-
 
 @app.route("/process", methods=["POST"])
 def process():
-    user_input = request.form.get("SpeechResult", "")
-    call_sid   = request.form.get("CallSid", "")
+    user_input = request.form.get("SpeechResult", "").strip()
+    r = VoiceResponse()
 
     if not user_input:
-        r = VoiceResponse()
-        r.say("Sorry, I didn't catch that. Please go ahead.",
-              voice="Polly.Joanna", language="en-US")
-        # re-enter gather quickly
+        r.say("Sorry, I didn't catch that.")
+        r.redirect("/voice")
+        return Response(str(r), mimetype="text/xml")
+
+    # Acknowledge quickly so caller knows we’re working
+    r.say("Got it. One moment while I check that.")
+
+    # ---- Responses API with File Search (vector store) ----
+    system_style = (
+        "You are Chloe, a calm, warm phone assistant for Foreclosure Relief Group. "
+        "Be concise (2–4 sentences). If unsure, say so and offer to connect to a specialist. "
+        "Only use information from the company knowledge base unless the question is general."
+    )
+
+    # Ask the model, letting it search your vector store
+    resp = client.responses.create(
+        model="gpt-4o-mini",                 # faster than full 4o; upgrade if you want
+        system=system_style,
+        input=user_input,
+        tools=[{
+            "type": "file_search",
+            "vector_store_ids": [VECTOR_STORE_ID],
+        }],
+        max_output_tokens=220
+    )
+
+    # Robustly extract text (helper exists in new SDKs)
+    ai_text = getattr(resp, "output_text", None)
+    if not ai_text:
+        # Fallback for older SDKs
+        try:
+            ai_text = resp.output[0].content[0].text
+        except Exception:
+            ai_text = "Sorry, I had trouble answering that."
+
+    # Speak the answer in shorter chunks
+    first_sentence = ai_text.split(". ")[0].strip()
+    r.say(first_sentence + ".")
+    if len(ai_text) > len(first_sentence) + 5:
+        r.pause(length=0.3)
+        r.say("Would you like more detail?")
+
+        # Re-gather so caller can say “Yes” or ask another question
         gather = r.gather(
             input="speech",
             action="/process",
             method="POST",
             speechTimeout="1",
-            language="en-US",
-            bargeIn="true"
+            language="en-US"
         )
+        gather.say("I'm listening.")
         return Response(str(r), mimetype="text/xml")
 
-    # store the text by CallSid, then respond immediately
-    PENDING_UTTERANCE[call_sid] = user_input
-
-    r = VoiceResponse()
-    # speak right away while we compute the real answer on /answer
-    r.say("Got it. One moment while I check that.", voice="Polly.Joanna", language="en-US")
-    r.redirect("/answer", method="POST")
-    return Response(str(r), mimetype="text/xml")
-
-@app.route("/answer", methods=["POST"])
-def answer():
-    call_sid = request.form.get("CallSid", "")
-    user_input = PENDING_UTTERANCE.pop(call_sid, "")
-
-    # safety net
-    if not user_input:
-        r = VoiceResponse()
-        r.say("Thanks for your patience. Please tell me your question once more.",
-              voice="Polly.Joanna", language="en-US")
-        g = r.gather(
-            input="speech",
-            action="/process",
-            method="POST",
-            speechTimeout="1",
-            language="en-US",
-            bargeIn="true"
-        )
-        return Response(str(r), mimetype="text/xml")
-
-    # --- run the Assistant (same assistant_id you already set) ---
-    thread = client.beta.threads.create()
-    client.beta.threads.messages.create(
-        thread_id=thread.id,
-        role="user",
-        content=user_input
-    )
-    run = client.beta.threads.runs.create(
-        thread_id=thread.id,
-        assistant_id=assistant_id,
-        # keep responses short & warm without changing your dashboard settings
-        instructions=(
-            "You are Chloe. Be warm and concise. "
-            "Answer in 2–3 short sentences. Avoid filler. "
-            "If the caller needs more detail, stop and offer to continue."
-        )
-    )
-    # poll for completion
-    status = run.status
-    while status not in ("completed", "failed", "cancelled"):
-        time.sleep(0.8)
-        status = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id).status
-
-    if status != "completed":
-        speak = "Sorry, something hiccupped. Could you repeat that?"
-    else:
-        msg = client.beta.threads.messages.list(thread_id=thread.id, order="desc")
-        full = msg.data[0].content[0].text.value.strip()
-
-        # --- Trim to 2–3 sentences for snappier TTS ---
-        sents = re.split(r'(?<=[.!?])\s+', full)
-        short = " ".join(sents[:3]).strip()
-        speak = short or "Here’s what I found."
-
-        # end with a natural follow up
-        if len(sents) > 3:
-            speak += " Would you like more detail?"
-
-    # --- speak the answer and re-open the mic quickly ---
-    r = VoiceResponse()
-    r.say(speak, voice="Polly.Joanna", language="en-US")
-    g = r.gather(
+    # Standard follow-up path
+    follow = r.gather(
         input="speech",
         action="/process",
         method="POST",
         speechTimeout="1",
-        language="en-US",
-        bargeIn="true"
+        language="en-US"
     )
-    g.say("Anything else I can help with?",
-          voice="Polly.Joanna", language="en-US")
+    follow.say("Anything else I can help with?")
     return Response(str(r), mimetype="text/xml")
 
-# --- Root: GET shows a simple message; POST redirects Twilio to /voice ---
-
+# ----------- Health & root (Render/Twilio safety) -----------
 @app.route("/", methods=["GET"])
 def index():
-    # Simple landing page so visiting the root doesn’t 404
     return "Chloe voice agent is running. POST /voice from Twilio.", 200
 
 @app.route("/", methods=["POST"])
 def root_redirect_to_voice():
     r = VoiceResponse()
-    # If Twilio posts to root by mistake, send it to /voice
     r.redirect("/voice", method="POST")
     return Response(str(r), mimetype="text/xml")
 
 @app.route("/health", methods=["GET"])
 def health():
-    # Render will try GETs (and you can use this for uptime checks)
     return {"status": "ok"}, 200
 
-
 if __name__ == "__main__":
-    import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
