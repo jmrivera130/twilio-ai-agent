@@ -5,6 +5,12 @@ from dotenv import load_dotenv
 import os
 import time
 
+import re
+from collections import defaultdict
+
+# simple per-call memory (lives only for the process life)
+PENDING_UTTERANCE = {}
+
 load_dotenv()
 api_key = os.getenv("OPENAI_API_KEY")
 assistant_id = os.getenv("CHLOE_ASSISTANT_ID")
@@ -14,68 +20,123 @@ app = Flask(__name__)
 
 @app.route("/voice", methods=["POST"])
 def voice():
-    response = VoiceResponse()
-    gather = response.gather(
+    r = VoiceResponse()
+    # Faster recognition + let caller interrupt prompts
+    gather = r.gather(
         input="speech",
         action="/process",
         method="POST",
-        speechTimeout="auto",
-        language="en-US"
+        speechTimeout="1",
+        language="en-US",
+        bargeIn="true"
     )
-    gather.say("Hi, this is Chloe from Foreclosure Relief Group.  ")
-    gather.say("How can I help you today?")
-    return Response(str(response), mimetype="text/xml")
+    # brief, welcoming prompt (shorter = less delay to next turn)
+    gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help you today?",
+               voice="Polly.Joanna", language="en-US")
+    return Response(str(r), mimetype="text/xml")
+
 
 @app.route("/process", methods=["POST"])
 def process():
     user_input = request.form.get("SpeechResult", "")
+    call_sid   = request.form.get("CallSid", "")
+
     if not user_input:
-        resp = VoiceResponse()
-        resp.say("Sorry, I didn’t catch that.")
-        resp.redirect("/voice")
-        return Response(str(resp), mimetype="text/xml")
+        r = VoiceResponse()
+        r.say("Sorry, I didn't catch that. Please go ahead.",
+              voice="Polly.Joanna", language="en-US")
+        # re-enter gather quickly
+        gather = r.gather(
+            input="speech",
+            action="/process",
+            method="POST",
+            speechTimeout="1",
+            language="en-US",
+            bargeIn="true"
+        )
+        return Response(str(r), mimetype="text/xml")
 
-    resp = VoiceResponse()
-    resp.say("Alright, just a second...")
+    # store the text by CallSid, then respond immediately
+    PENDING_UTTERANCE[call_sid] = user_input
 
+    r = VoiceResponse()
+    # speak right away while we compute the real answer on /answer
+    r.say("Got it. One moment while I check that.", voice="Polly.Joanna", language="en-US")
+    r.redirect("/answer", method="POST")
+    return Response(str(r), mimetype="text/xml")
+
+@app.route("/answer", methods=["POST"])
+def answer():
+    call_sid = request.form.get("CallSid", "")
+    user_input = PENDING_UTTERANCE.pop(call_sid, "")
+
+    # safety net
+    if not user_input:
+        r = VoiceResponse()
+        r.say("Thanks for your patience. Please tell me your question once more.",
+              voice="Polly.Joanna", language="en-US")
+        g = r.gather(
+            input="speech",
+            action="/process",
+            method="POST",
+            speechTimeout="1",
+            language="en-US",
+            bargeIn="true"
+        )
+        return Response(str(r), mimetype="text/xml")
+
+    # --- run the Assistant (same assistant_id you already set) ---
     thread = client.beta.threads.create()
     client.beta.threads.messages.create(
         thread_id=thread.id,
         role="user",
-        content=user_input,
-        attachments=[
-            {"file_id": "file-BGiRXdsiJhHh4NzTxzCAeW", "tools": [{"type": "file_search"}]},
-            {"file_id": "file-7zPQWPh7tCCmteBDuFX93z", "tools": [{"type": "file_search"}]}
-        ],
+        content=user_input
     )
-
     run = client.beta.threads.runs.create(
         thread_id=thread.id,
-        assistant_id=assistant_id
+        assistant_id=assistant_id,
+        # keep responses short & warm without changing your dashboard settings
+        instructions=(
+            "You are Chloe. Be warm and concise. "
+            "Answer in 2–3 short sentences. Avoid filler. "
+            "If the caller needs more detail, stop and offer to continue."
+        )
     )
-
-    while True:
+    # poll for completion
+    status = run.status
+    while status not in ("completed", "failed", "cancelled"):
+        time.sleep(0.8)
         status = client.beta.threads.runs.retrieve(thread_id=thread.id, run_id=run.id).status
-        if status == "completed":
-            break
-        if status in ["failed", "cancelled"]:
-            resp.say("Sorry, something went wrong.")
-            return Response(str(resp), mimetype="text/xml")
-        time.sleep(1)
 
-    msg = client.beta.threads.messages.list(thread_id=thread.id, order="desc")
-    ai_reply = msg.data[0].content[0].text.value.strip()
-    resp.say(ai_reply)
+    if status != "completed":
+        speak = "Sorry, something hiccupped. Could you repeat that?"
+    else:
+        msg = client.beta.threads.messages.list(thread_id=thread.id, order="desc")
+        full = msg.data[0].content[0].text.value.strip()
 
-    gather = resp.gather(
+        # --- Trim to 2–3 sentences for snappier TTS ---
+        sents = re.split(r'(?<=[.!?])\s+', full)
+        short = " ".join(sents[:3]).strip()
+        speak = short or "Here’s what I found."
+
+        # end with a natural follow up
+        if len(sents) > 3:
+            speak += " Would you like more detail?"
+
+    # --- speak the answer and re-open the mic quickly ---
+    r = VoiceResponse()
+    r.say(speak, voice="Polly.Joanna", language="en-US")
+    g = r.gather(
         input="speech",
         action="/process",
         method="POST",
-        speechTimeout="auto",
-        language="en-US"
+        speechTimeout="1",
+        language="en-US",
+        bargeIn="true"
     )
-    gather.say("Is there anything else I can help with?")
-    return Response(str(resp), mimetype="text/xml")
+    g.say("Anything else I can help with?",
+          voice="Polly.Joanna", language="en-US")
+    return Response(str(r), mimetype="text/xml")
 
 # --- Root: GET shows a simple message; POST redirects Twilio to /voice ---
 
