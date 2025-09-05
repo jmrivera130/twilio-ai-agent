@@ -47,24 +47,37 @@ def process():
 
     # Ask the model, letting it search your vector store
     resp = client.responses.create(
-        model="gpt-4o-mini",                 # faster than full 4o; upgrade if you want
-        system=system_style,
-        input=user_input,
-        tools=[{
-            "type": "file_search",
-            "vector_store_ids": [VECTOR_STORE_ID],
-        }],
-        max_output_tokens=220
-    )
+        model="gpt-4o-mini",                  # fast; you can try gpt-4o later
+        instructions=(
+            "You are Chloe, a warm, calm phone agent for Foreclosure Relief Group. "
+            "Acknowledge briefly, speak in 1–3 short sentences, avoid rambling, "
+            "and ask a helpful follow-up only if needed."
+        ),
+        input=user_input,                     # the caller’s utterance
+        tools=[{"type": "file_search"}],      # use your uploaded PDFs
+        attachments=[
+            {"file_id": "file-BGiRXdsiJhHh4NzTxzCAeW", "tools": [{"type": "file_search"}]},
+            {"file_id": "file-7zPQWPh7tCCmteBDuFX93z", "tools": [{"type": "file_search"}]},
+        ],
+        temperature=0.4,
+        max_output_tokens=220,
+)
+
 
     # Robustly extract text (helper exists in new SDKs)
     ai_text = getattr(resp, "output_text", None)
     if not ai_text:
         # Fallback for older SDKs
         try:
-            ai_text = resp.output[0].content[0].text
+            ai_reply = resp.output_text.strip()
         except Exception:
-            ai_text = "Sorry, I had trouble answering that."
+            # Fallback in case the SDK shape differs
+            ai_reply = (
+                resp.output[0].content[0].text.strip()
+                if getattr(resp, "output", None)
+                else "Sorry, I had trouble answering that."
+            )
+
 
     # Speak the answer in shorter chunks
     first_sentence = ai_text.split(". ")[0].strip()
