@@ -47,22 +47,28 @@ def process():
 
     # Ask the model, letting it search your vector store
     resp = client.responses.create(
-        model="gpt-4o-mini",                  # fast; you can try gpt-4o later
-        instructions=(
-            "You are Chloe, a warm, calm phone agent for Foreclosure Relief Group. "
-            "Acknowledge briefly, speak in 1–3 short sentences, avoid rambling, "
-            "and ask a helpful follow-up only if needed."
-        ),
-        input=user_input,                     # the caller’s utterance
-        tools=[{"type": "file_search"}],      # use your uploaded PDFs
-        attachments=[
-            {"file_id": "file-BGiRXdsiJhHh4NzTxzCAeW", "tools": [{"type": "file_search"}]},
-            {"file_id": "file-7zPQWPh7tCCmteBDuFX93z", "tools": [{"type": "file_search"}]},
-        ],
-        temperature=0.4,
-        max_output_tokens=220,
+    model="gpt-4o-mini",
+    instructions=(
+        "You are Chloe, a warm, calm phone agent for Foreclosure Relief Group. "
+        "Acknowledge briefly, speak in 1–3 short sentences, avoid rambling, "
+        "and ask a helpful follow-up only if needed."
+    ),
+    tools=[{"type": "file_search"}],           # enable retrieval
+    input=[                                     # <-- structured input so we can attach files
+        {
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": user_input}
+            ],
+            "attachments": [
+                {"file_id": "file-BGiRXdsiJhHh4NzTxzCAeW", "tools": [{"type": "file_search"}]},
+                {"file_id": "file-7zPQWPh7tCCmteBDuFX93z", "tools": [{"type": "file_search"}]},
+            ],
+        }
+    ],
+    temperature=0.4,
+    max_output_tokens=220,
 )
-
 
     # Robustly extract text (helper exists in new SDKs)
     ai_text = getattr(resp, "output_text", None)
