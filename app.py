@@ -77,10 +77,19 @@ def process():
     gather.say("Is there anything else I can help with?")
     return Response(str(resp), mimetype="text/xml")
 
+# --- Root: GET shows a simple message; POST redirects Twilio to /voice ---
+
 @app.route("/", methods=["GET"])
 def index():
     # Simple landing page so visiting the root doesn’t 404
     return "Chloe voice agent is running. POST /voice from Twilio.", 200
+
+@app.route("/", methods=["POST"])
+def root_redirect_to_voice():
+    r = VoiceResponse()
+    # If Twilio posts to root by mistake, send it to /voice
+    r.redirect("/voice", method="POST")
+    return Response(str(r), mimetype="text/xml")
 
 @app.route("/health", methods=["GET"])
 def health():
