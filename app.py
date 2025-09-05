@@ -77,6 +77,17 @@ def process():
     gather.say("Is there anything else I can help with?")
     return Response(str(resp), mimetype="text/xml")
 
+@app.route("/", methods=["GET"])
+def index():
+    # Simple landing page so visiting the root doesn’t 404
+    return "Chloe voice agent is running. POST /voice from Twilio.", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    # Render will try GETs (and you can use this for uptime checks)
+    return {"status": "ok"}, 200
+
+
 if __name__ == "__main__":
     import os
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
