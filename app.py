@@ -1,11 +1,18 @@
-# app.py  (COMPLETE FILE - REPLACE YOURS)
-import os, time
+# app.py — COMPLETE FILE (replace your current file)
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
+from dotenv import load_dotenv
 from openai import OpenAI
+import os
 
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID")
+load_dotenv()
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+VECTOR_STORE_ID = os.getenv("CHLOE_VECTOR_STORE_ID") or os.getenv("VECTOR_STORE_ID")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # swap to gpt-4o if you want richer answers
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is missing. Set it in Render Environment and/or .env.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = Flask(__name__)
@@ -14,103 +21,73 @@ app = Flask(__name__)
 @app.route("/voice", methods=["POST"])
 def voice():
     r = VoiceResponse()
-    # Faster turn-taking: short timeout; keep prompt brief
     gather = r.gather(
         input="speech",
         action="/process",
         method="POST",
-        speechTimeout="1",
+        speechTimeout="1",     # fast turn-taking
         language="en-US"
     )
-    gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help you today?")
+    gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help?")
     return Response(str(r), mimetype="text/xml")
 
 @app.route("/process", methods=["POST"])
 def process():
-    user_input = request.form.get("SpeechResult", "").strip()
+    user_input = (request.form.get("SpeechResult") or "").strip()
     r = VoiceResponse()
 
     if not user_input:
-        r.say("Sorry, I didn't catch that.")
+        r.say("Sorry, I didn’t catch that. Could you repeat?")
         r.redirect("/voice")
         return Response(str(r), mimetype="text/xml")
 
-    # Acknowledge quickly so caller knows we’re working
+    # Small acknowledgement to feel responsive
     r.say("Got it. One moment while I check that.")
 
-    # ---- Responses API with File Search (vector store) ----
-    system_style = (
-        "You are Chloe, a calm, warm phone assistant for Foreclosure Relief Group. "
-        "Be concise (2–4 sentences). If unsure, say so and offer to connect to a specialist. "
-        "Only use information from the company knowledge base unless the question is general."
-    )
+    # Build Responses call. NOTE: no attachments. Use file_search + vector_store_ids.
+    tools = []
+    if VECTOR_STORE_ID:
+        tools = [{
+            "type": "file_search",
+            "vector_store_ids": [VECTOR_STORE_ID],
+        }]
 
-    # Ask the model, letting it search your vector store
-    resp = client.responses.create(
-    model="gpt-4o-mini",  # use gpt-4o if you want richer answers; 4o-mini is faster/cheaper
-    instructions=(
-        "You are Chloe, a calm, warm assistant for the Foreclosure Relief Group. "
-        "Use the provided files via file_search for facts. Keep replies under 4 short sentences. "
-        "Start with a brief acknowledgment like 'Got it — one moment.'"
-    ),
-
-    # The user's utterance
-    input=[
-        {
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": user_input}
-            ]
-        }
-    ],
-
-    # Enable file_search tool globally
-    tools=[{"type": "file_search"}],
-
-    # IMPORTANT: attachments go at the TOP LEVEL (not inside input)
-    attachments=[
-        {"file_id": "file-BGiRXdsiJhHh4NzTxzCAeW", "tools": [{"type": "file_search"}]},
-        {"file_id": "file-7zPQWPh7tCCmteBDuFX93z", "tools": [{"type": "file_search"}]},
-    ],
-
-    max_output_tokens=220,
-)
-
-
-    # Robustly extract text (helper exists in new SDKs)
-    ai_text = getattr(resp, "output_text", None)
-    if not ai_text:
-        # Fallback for older SDKs
-        try:
-            ai_reply = resp.output_text.strip()
-        except Exception:
-            # Fallback in case the SDK shape differs
-            ai_reply = (
-                resp.output[0].content[0].text.strip()
-                if getattr(resp, "output", None)
-                else "Sorry, I had trouble answering that."
-            )
-
-
-    # Speak the answer in shorter chunks
-    first_sentence = ai_text.split(". ")[0].strip()
-    r.say(first_sentence + ".")
-    if len(ai_text) > len(first_sentence) + 5:
-        r.pause(length=0.3)
-        r.say("Would you like more detail?")
-
-        # Re-gather so caller can say “Yes” or ask another question
-        gather = r.gather(
-            input="speech",
-            action="/process",
-            method="POST",
-            speechTimeout="1",
-            language="en-US"
+    try:
+        resp = client.responses.create(
+            model=MODEL,
+            instructions=(
+                "You are Chloe, a calm, warm, professional phone assistant for the Foreclosure Relief Group. "
+                "Answer using the provided knowledge base when foreclosure topics come up. "
+                "If unsure, say so and offer to connect or schedule. "
+                "Keep replies under four short sentences."
+            ),
+            input=[{"role": "user", "content": user_input}],
+            tools=tools,
+            max_output_tokens=220,
+            temperature=0.4,
         )
-        gather.say("I'm listening.")
-        return Response(str(r), mimetype="text/xml")
 
-    # Standard follow-up path
+        # Prefer the helper; fall back if SDK shape differs
+        ai_text = getattr(resp, "output_text", None)
+        if not ai_text:
+            # Defensive fallback
+            try:
+                # Some SDK versions expose .output as a list of chunks
+                ai_text = resp.output[0].content[0].text
+            except Exception:
+                ai_text = "Sorry, I had trouble finding an answer to that."
+
+    except Exception:
+        ai_text = "Sorry, I hit an error while looking that up."
+
+    # Speak a short chunk, then invite follow-up to keep calls snappy
+    first = ai_text.split(". ")[0].strip()
+    if first:
+        r.say(first + ".")
+    else:
+        r.say(ai_text)
+
+    # Quick follow-up gather
     follow = r.gather(
         input="speech",
         action="/process",
@@ -118,7 +95,8 @@ def process():
         speechTimeout="1",
         language="en-US"
     )
-    follow.say("Anything else I can help with?")
+    follow.say("Would you like more detail on that?")
+
     return Response(str(r), mimetype="text/xml")
 
 # ----------- Health & root (Render/Twilio safety) -----------
@@ -137,4 +115,5 @@ def health():
     return {"status": "ok"}, 200
 
 if __name__ == "__main__":
+    # Local run (ignored on Render because you use `gunicorn app:app`)
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

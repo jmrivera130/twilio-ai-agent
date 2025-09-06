@@ -1,26 +1,41 @@
-# create_vector_store.py  (RUN LOCALLY ONCE)
-import os
-from openai import OpenAI
+# create_vector_store.py
+import os, glob, sys
 from dotenv import load_dotenv
+from openai import OpenAI
 
 load_dotenv()
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+api_key = os.getenv("OPENAI_API_KEY")
+if not api_key:
+    print("ERROR: OPENAI_API_KEY missing in environment/.env")
+    sys.exit(1)
 
-# 1) Create a new vector store on OpenAI
-store = client.vector_stores.create(name="Chloe Knowledge Base")
-print("Vector store ID:", store.id)
+client = OpenAI(api_key=api_key)
 
-# 2) Upload all PDFs in /data into the store
-data_dir = "data"
-files = [os.path.join(data_dir, f) for f in os.listdir(data_dir) if f.lower().endswith(".pdf")]
-if not files:
-    print("No PDFs found in ./data. Add your PDFs there and re-run.")
-    raise SystemExit(1)
+# 1) Create a vector store (server will handle chunking/embedding)
+vs = client.vector_stores.create(name="Chloe-KB")
+print(f"Created vector store: {vs.id}")
 
-for path in files:
-    up = client.files.create(file=open(path, "rb"), purpose="assistants")
-    client.vector_stores.files.create(vector_store_id=store.id, file_id=up.id)
-    print(f"Uploaded {os.path.basename(path)} → {up.id}")
+# 2) Collect local files
+file_paths = glob.glob("data/*.pdf") + glob.glob("data/*.txt")
+if not file_paths:
+    print("ERROR: No files found in ./data. Add your PDFs/TXTs there and rerun.")
+    sys.exit(1)
 
-print("\n✅ Done. Copy this VECTOR_STORE_ID into your Render env vars:")
-print("VECTOR_STORE_ID=", store.id)
+# 3) Upload files to OpenAI Files
+file_ids = []
+for path in file_paths:
+    with open(path, "rb") as f:
+        up = client.files.create(file=f, purpose="assistants")
+        print(f"Uploaded {os.path.basename(path)} → {up.id}")
+        file_ids.append(up.id)
+
+# 4) Attach those files to the vector store (batch & poll until indexed)
+batch = client.vector_stores.file_batches.create_and_poll(
+    vector_store_id=vs.id,
+    file_ids=file_ids
+)
+
+print("Vector store ready.")
+print("VECTOR_STORE_ID:", vs.id)
+print("Batch status:", batch.status)
+print("File counts:", batch.file_counts)
