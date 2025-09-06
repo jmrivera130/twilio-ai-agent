@@ -23,8 +23,6 @@ TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 
 if not OPENAI_API_KEY:
     raise RuntimeError("OPENAI_API_KEY missing.")
-if not PUBLIC_HOST_URL:
-    raise RuntimeError("PUBLIC_HOST_URL missing (e.g. https://<your-app>.onrender.com)")
 if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
     raise RuntimeError("TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing.")
 
@@ -82,7 +80,7 @@ def voice():
     return Response(str(r), mimetype="text/xml")
 
 # ---------- Background worker ----------
-def generate_and_redirect(call_sid: str, user_input: str):
+def generate_and_redirect(call_sid: str, user_input: str, base_url: str):
     """Runs in a thread: call OpenAI, then redirect the live call to /speak with the answer."""
     try:
         history = SESSIONS[call_sid][-4:]  # short context to avoid repetition/latency
@@ -124,7 +122,7 @@ def generate_and_redirect(call_sid: str, user_input: str):
 
         # Redirect the live call to /speak with the answer
         safe_text = quote(ai_text[:1400])  # keep URL small
-        speak_url = f"{PUBLIC_HOST_URL}/speak?text={safe_text}"
+        speak_url = f"{base_url}/speak?text={safe_text}"
         client_twilio.calls(call_sid).update(url=speak_url, method="GET")
 
     except Exception as e:
@@ -170,9 +168,14 @@ def process():
     r.pause(length=2)  # gives background thread time to compute
     # Return this TwiML quickly...
     twiml = Response(str(r), mimetype="text/xml")
+    base_url = (os.getenv("PUBLIC_HOST_URL") or request.host_url).rstrip("/")
 
     # ...and do the model call + redirect in the background
-    threading.Thread(target=generate_and_redirect, args=(call_sid, user_input), daemon=True).start()
+    threading.Thread(
+    target=generate_and_redirect,
+    args=(call_sid, user_input, base_url),
+    daemon=True
+).start()
     return twiml
 
 # ---------- Speak endpoint (Twilio will GET this after we redirect the call) ----------
