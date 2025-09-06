@@ -1,33 +1,61 @@
-# app.py — COMPLETE FILE (replace your current file)
-# app.py — unified, production-safe
+# app.py — fast-turn Voice agent with background generation + redirect
 from flask import Flask, request, Response
 from twilio.twiml.voice_response import VoiceResponse
+from twilio.rest import Client as TwilioClient
 from dotenv import load_dotenv
 from openai import OpenAI
 from collections import defaultdict
+from urllib.parse import quote
+import threading
 import os
 import re
 
 load_dotenv()
 
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-VECTOR_STORE_ID = os.getenv("CHLOE_VECTOR_STORE_ID") or os.getenv("VECTOR_STORE_ID")
-MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # swap to gpt-4o / gpt-5-mini if needed
+# ---- Env ----
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
+VECTOR_STORE_ID  = os.getenv("CHLOE_VECTOR_STORE_ID") or os.getenv("VECTOR_STORE_ID")
+MODEL            = os.getenv("OPENAI_MODEL", "gpt-4o-mini")  # try "gpt-4o" later for richer answers
+PUBLIC_HOST_URL  = os.getenv("PUBLIC_HOST_URL")              # e.g. https://chloe-ai-agent.onrender.com
+
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN  = os.getenv("TWILIO_AUTH_TOKEN")
 
 if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY is missing. Set it in Render Environment and/or .env.")
-client = OpenAI(api_key=OPENAI_API_KEY)
+    raise RuntimeError("OPENAI_API_KEY missing.")
+if not PUBLIC_HOST_URL:
+    raise RuntimeError("PUBLIC_HOST_URL missing (e.g. https://<your-app>.onrender.com)")
+if not TWILIO_ACCOUNT_SID or not TWILIO_AUTH_TOKEN:
+    raise RuntimeError("TWILIO_ACCOUNT_SID / TWILIO_AUTH_TOKEN missing.")
 
+# ---- Clients ----
+client_oai   = OpenAI(api_key=OPENAI_API_KEY)
+client_twilio = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+
+# ---- App & memory ----
 app = Flask(__name__)
+SESSIONS = defaultdict(list)   # { CallSid: [ {"role": "user"/"assistant", "content": "..."} ] }
+MAX_TURNS = 8
 
-# Simple per-call memory (in-process). Keyed by Twilio CallSid.
-SESSIONS = defaultdict(list)  # { call_sid: [ {"role": "...", "content": "..."}, ... ] }
-MAX_TURNS = 8  # avoid runaway loops per call
+# Simple keyword gate to avoid doing file_search on chit-chat
+FORECLOSURE_KEYWORDS = [
+    "foreclosure", "pre-foreclosure", "notice of default", "auction", "sale date",
+    "short sale", "loan modification", "forbearance", "reinstatement", "repayment plan",
+    "deed in lieu", "lis pendens"
+]
 
-# ----------- Health & root (Render/Twilio safety) -----------
+def needs_file_search(text: str) -> bool:
+    t = text.lower()
+    return any(k in t for k in FORECLOSURE_KEYWORDS)
+
+# ---------- Health & root ----------
 @app.route("/", methods=["GET"])
 def index():
     return "Chloe voice agent is running. POST /voice from Twilio.", 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return {"status": "ok"}, 200
 
 @app.route("/", methods=["POST"])
 def root_redirect_to_voice():
@@ -35,11 +63,7 @@ def root_redirect_to_voice():
     r.redirect("/voice", method="POST")
     return Response(str(r), mimetype="text/xml")
 
-@app.route("/health", methods=["GET"])
-def health():
-    return {"status": "ok"}, 200
-
-# ----------- Twilio entrypoints -----------
+# ---------- Voice entry ----------
 @app.route("/voice", methods=["POST"])
 def voice():
     r = VoiceResponse()
@@ -47,26 +71,85 @@ def voice():
         input="speech",
         action="/process",
         method="POST",
-        speechTimeout="2",          # brief pause allowed without cutting off
+        speechTimeout="2",        # allow brief pause
         language="en-US",
         bargeIn="true",
-        speechModel="phone_call",   # telephone-optimized STT
-        hints="foreclosure, pre-foreclosure, short sale, loan modification, forbearance, "
-              "notice of default, auction date, reinstatement, repayment plan, deed in lieu"
+        speechModel="phone_call", # phone-optimized STT
+        hints=("foreclosure, pre-foreclosure, short sale, loan modification, forbearance, "
+               "notice of default, auction date, reinstatement, repayment plan, deed in lieu")
     )
     gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help?")
     return Response(str(r), mimetype="text/xml")
 
+# ---------- Background worker ----------
+def generate_and_redirect(call_sid: str, user_input: str):
+    """Runs in a thread: call OpenAI, then redirect the live call to /speak with the answer."""
+    try:
+        history = SESSIONS[call_sid][-4:]  # short context to avoid repetition/latency
+        # Build tools list only if the question looks on-topic
+        tools = []
+        if VECTOR_STORE_ID and needs_file_search(user_input):
+            tools = [{
+                "type": "file_search",
+                "vector_store_ids": [VECTOR_STORE_ID],
+                # You can also try: "max_num_results": 3
+            }]
+
+        resp = client_oai.responses.create(
+            model=MODEL,
+            instructions=(
+                "You are Chloe, a calm, warm, professional phone assistant for the Foreclosure Relief Group. "
+                "Use the knowledge base for foreclosure topics. Keep answers to 2–3 short sentences. "
+                "Avoid filler and repetition. If unsure, say so and offer to collect details or schedule."
+            ),
+            input=history + [{"role": "user", "content": user_input}],
+            tools=tools,
+            max_output_tokens=180,
+            temperature=0.2,
+        )
+
+        ai_text = getattr(resp, "output_text", None)
+        if not ai_text:
+            try:
+                ai_text = resp.output[0].content[0].text
+            except Exception:
+                ai_text = "Sorry, I had trouble finding an answer to that."
+
+        ai_text = (ai_text or "").strip()
+
+        # Save assistant turn
+        SESSIONS[call_sid].append({"role": "assistant", "content": ai_text})
+        if len(SESSIONS[call_sid]) > MAX_TURNS:
+            SESSIONS[call_sid] = SESSIONS[call_sid][-MAX_TURNS:]
+
+        # Redirect the live call to /speak with the answer
+        safe_text = quote(ai_text[:1400])  # keep URL small
+        speak_url = f"{PUBLIC_HOST_URL}/speak?text={safe_text}"
+        client_twilio.calls(call_sid).update(url=speak_url, method="GET")
+
+    except Exception as e:
+        # On error, send a short apology
+        safe_text = quote("Sorry, I hit an error while looking that up.")
+        speak_url = f"{PUBLIC_HOST_URL}/speak?text={safe_text}"
+        try:
+            client_twilio.calls(call_sid).update(url=speak_url, method="GET")
+        except Exception:
+            pass
+
+# ---------- Process user speech ----------
 @app.route("/process", methods=["POST"])
 def process():
-    call_sid = request.form.get("CallSid") or "unknown"
+    call_sid  = request.form.get("CallSid") or "unknown"
     user_input = (request.form.get("SpeechResult") or "").strip()
 
     r = VoiceResponse()
 
-    # basic done/exit detector before anything else
+    # exit phrases
     lower = user_input.lower()
-    if any(kw in lower for kw in ["that's all", "that is all", "i'm good", "im good", "no thanks", "no, thanks", "nope", "bye", "goodbye", "hang up"]):
+    if any(kw in lower for kw in [
+        "that's all", "that is all", "i'm good", "im good", "no thanks", "no, thanks",
+        "nope", "bye", "goodbye", "hang up"
+    ]):
         r.say("Okay. Thanks for calling. Take care.")
         r.hangup()
         SESSIONS.pop(call_sid, None)
@@ -77,67 +160,38 @@ def process():
         r.redirect("/voice")
         return Response(str(r), mimetype="text/xml")
 
-    # Small acknowledgement to feel responsive
+    # Save user turn
+    SESSIONS[call_sid].append({"role": "user", "content": user_input})
+    if len(SESSIONS[call_sid]) > MAX_TURNS:
+        SESSIONS[call_sid] = SESSIONS[call_sid][-MAX_TURNS:]
+
+    # Immediately respond so there is no dead air, then compute in background
     r.say("Got it. One moment while I check that.")
+    r.pause(length=2)  # gives background thread time to compute
+    # Return this TwiML quickly...
+    twiml = Response(str(r), mimetype="text/xml")
 
-    # Maintain short per-call history
-    history = SESSIONS[call_sid]
-    history.append({"role": "user", "content": user_input})
-    if len(history) > MAX_TURNS:
-        history = history[-MAX_TURNS:]
-        SESSIONS[call_sid] = history
+    # ...and do the model call + redirect in the background
+    threading.Thread(target=generate_and_redirect, args=(call_sid, user_input), daemon=True).start()
+    return twiml
 
-    # Build Responses call — file_search via vector_store_ids (no attachments)
-    tools = []
-    if VECTOR_STORE_ID:
-        tools = [{
-            "type": "file_search",
-            "vector_store_ids": [VECTOR_STORE_ID],
-        }]
+# ---------- Speak endpoint (Twilio will GET this after we redirect the call) ----------
+@app.route("/speak", methods=["GET"])
+def speak():
+    text = request.args.get("text", "").strip()
+    r = VoiceResponse()
 
-    try:
-        resp = client.responses.create(
-            model=MODEL,
-            instructions=(
-                "You are Chloe, a calm, warm, professional phone assistant for the Foreclosure Relief Group. "
-                "Use the knowledge base to answer questions about foreclosure, pre-foreclosure, and alternatives. "
-                "If something is unclear or outside scope, say so and offer to collect details or schedule. "
-                "Keep replies under three short sentences. Avoid filler and repetition."
-            ),
-            # include short memory to reduce 'Who am I talking to?' loops
-            input=history[-4:],   # last few turns only to keep latency down
-            tools=tools,
-            max_output_tokens=200,
-            temperature=0.2,
-        )
+    # Say only first sentence for snappiness; offer more detail if long
+    first = re.split(r"(?<=[.!?])\s+", text)[0] if text else ""
+    to_say = first if first else text
+    if to_say and not to_say.endswith((".", "!", "?")):
+        to_say += "."
 
-        ai_text = getattr(resp, "output_text", None)
-        if not ai_text:
-            # Defensive fallback for SDK variants
-            try:
-                ai_text = resp.output[0].content[0].text
-            except Exception:
-                ai_text = "Sorry, I had trouble finding an answer to that."
-        ai_text = (ai_text or "").strip()
+    # You can set a better voice if your Twilio plan supports Polly voices:
+    # r.say(to_say, voice="Polly.Joanna")  # if supported; otherwise default voice
+    r.say(to_say)
 
-    except Exception:
-        ai_text = "Sorry, I hit an error while looking that up."
-
-    # Prevent obvious repetition with last assistant message
-    last_assistant = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
-    if last_assistant and ai_text and ai_text[:80] == last_assistant[:80]:
-        ai_text = "To add to what I said, would you like me to explain options or next steps?"
-
-    # Speak only the first sentence for snappiness; offer detail after
-    first_sentence = re.split(r"(?<=[.!?])\s+", ai_text.strip())[0] if ai_text else ""
-    to_say = (first_sentence + ("" if first_sentence.endswith((".", "!", "?")) else ".")) if first_sentence else ai_text
-    r.say(to_say or "Sorry, I couldn’t get a response just now.")
-
-    # Save assistant turn to memory
-    history.append({"role": "assistant", "content": ai_text})
-    SESSIONS[call_sid] = history
-
-    # Follow-up with improved STT settings
+    # Follow-up gather (keep it short)
     follow = r.gather(
         input="speech",
         action="/process",
@@ -148,9 +202,7 @@ def process():
         speechModel="phone_call",
         hints="yes, no, more detail, repeat, appointment, schedule, address, email, phone"
     )
-    follow_prompt = "Would you like more detail on that?" if len(ai_text) > 220 else "Anything else I can help with?"
-    follow.say(follow_prompt)
-
+    follow.say("Would you like more detail on that?")
     return Response(str(r), mimetype="text/xml")
 
 if __name__ == "__main__":
