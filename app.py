@@ -21,12 +21,17 @@ app = Flask(__name__)
 @app.route("/voice", methods=["POST"])
 def voice():
     r = VoiceResponse()
+    # in /voice route
     gather = r.gather(
         input="speech",
         action="/process",
         method="POST",
-        speechTimeout="1",     # fast turn-taking
-        language="en-US"
+        speechTimeout="2",             # was "1"
+        language="en-US",
+        bargeIn="true",
+        speechModel="phone_call",      # better for calls
+        hints="foreclosure, pre-foreclosure, short sale, loan modification, forbearance, "
+            "notice of default, auction date, reinstatement, repayment plan, deed in lieu"
     )
     gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help?")
     return Response(str(r), mimetype="text/xml")
@@ -54,17 +59,21 @@ def process():
 
     try:
         resp = client.responses.create(
-            model=MODEL,
+            model=MODEL,  # e.g., gpt-4o-mini (fast) or gpt-4o (richer)
             instructions=(
                 "You are Chloe, a calm, warm, professional phone assistant for the Foreclosure Relief Group. "
-                "Answer using the provided knowledge base when foreclosure topics come up. "
-                "If unsure, say so and offer to connect or schedule. "
-                "Keep replies under four short sentences."
+                "First, acknowledge briefly (e.g., 'Got it — one moment.'). "
+                "Answer using the knowledge base for foreclosure topics. "
+                "Keep replies under 3 short sentences. Avoid filler and repetition. "
+                "If unsure or outside scope, say so and offer to collect info or schedule."
             ),
             input=[{"role": "user", "content": user_input}],
-            tools=tools,
-            max_output_tokens=220,
-            temperature=0.4,
+            tools=[{
+                "type": "file_search",
+                "vector_store_ids": [VECTOR_STORE_ID] if VECTOR_STORE_ID else []
+            }],
+            temperature=0.2,
+            max_output_tokens=200,
         )
 
         # Prefer the helper; fall back if SDK shape differs
