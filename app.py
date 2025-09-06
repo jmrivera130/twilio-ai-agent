@@ -64,20 +64,16 @@ def root_redirect_to_voice():
 # ---------- Voice entry ----------
 @app.route("/voice", methods=["POST"])
 def voice():
-    r = VoiceResponse()
-    gather = r.gather(
-        input="speech",
-        action="/process",
-        method="POST",
-        speechTimeout="2",        # allow brief pause
-        language="en-US",
-        bargeIn="true",
-        speechModel="phone_call", # phone-optimized STT
-        hints=("foreclosure, pre-foreclosure, short sale, loan modification, forbearance, "
-               "notice of default, auction date, reinstatement, repayment plan, deed in lieu")
-    )
-    gather.say("Hi, this is Chloe from Foreclosure Relief Group. How can I help?")
-    return Response(str(r), mimetype="text/xml")
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Connect>
+    <ConversationRelay
+      url="{os.environ['RELAY_WSS_URL']}"
+      welcomeGreeting="Hi, I’m Chloe. How can I help?"
+    />
+  </Connect>
+</Response>"""
+    return Response(twiml, mimetype="text/xml")
 
 # ---------- Background worker ----------
 def generate_and_redirect(call_sid: str, user_input: str, base_url: str):
