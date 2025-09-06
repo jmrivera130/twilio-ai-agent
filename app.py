@@ -104,14 +104,14 @@ async def relay(ws: WebSocket):
 
             # 1) Greet immediately on setup so you hear voice right away
             if mtype == "setup":
+                # ---- Tell ConversationRelay to speak the text ----
                 await ws.send_json({
-                    "type": "response",
-                    "actions": [{
-                        "say": "Hi, I’m Chloe. How can I help?",
-                        "barge": True,
-                        "voice": voice
-                    }]
+                    "type": "text",
+                    "token": ai_text,   # the text you want Chloe to speak
+                    "last": True        # send True if this is a complete response (not streaming)
                 })
+
+             
                 continue
 
             # 2) Handle recognized speech from the caller
