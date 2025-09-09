@@ -1,42 +1,84 @@
-# app.py — FastAPI + Twilio Conversation Relay + OpenAI Responses (text frames)
-
 import os
+import re
+import json
+import httpx
+from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from openai import OpenAI
+from twilio.rest import Client as TwilioRest
 
-# ---------- required env ----------
-OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]   # wss://<your-app>.onrender.com/relay
+# ---- Env & clients ----
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL")  # wss://.../relay  (Render env)
+TTS_VOICE = os.environ.get("TTS_VOICE", "Joanna-Neural")           # Amazon Polly voice name
+CALCOM_USERNAME = os.environ.get("CALCOM_USERNAME", "")            # e.g., 'foreclosure-relief'
+CALCOM_EVENT_SLUG = os.environ.get("CALCOM_EVENT_SLUG", "")        # e.g., 'consultation-15'
+BOOKING_URL_BASE = os.environ.get("CALCOM_BOOKING_URL") or (f"https://cal.com/{CALCOM_USERNAME}/{CALCOM_EVENT_SLUG}" if CALCOM_USERNAME and CALCOM_EVENT_SLUG else None)
+
+TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+TWILIO_MESSAGING_FROM = os.environ.get("TWILIO_MESSAGING_FROM")  # your SMS-enabled Twilio number
+
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY is required")
+if not RELAY_WSS_URL:
+    raise RuntimeError("RELAY_WSS_URL is required")
+
+# Optional Twilio SMS client
+twilio_client = None
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN and TWILIO_MESSAGING_FROM:
+    twilio_client = TwilioRest(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI()
 
 SYSTEM_PROMPT = (
-    "You are Chloe from Foreclosure Relief Group. Be warm, concise, and clear. "
-    "Prefer 1–3 short sentences. Avoid filler. Offer more detail only if asked."
+    "You are Chloe, a warm, concise phone assistant for Foreclosure Relief Group. "
+    "Prioritize brevity (2–4 sentences). Use active-listening cues ('Got it', 'Understood'), "
+    "and speak naturally and slowly. If caller asks to book an appointment, say you can text a secure booking link."
 )
 
-# ---------- HTTP: Twilio hits /voice ----------
+app = FastAPI()
+
+def extract_text(msg: dict) -> str | None:
+    # ConversationRelay prompt frames look like: {'type':'prompt','voicePrompt':'text',...}
+    if not isinstance(msg, dict):
+        return None
+    if msg.get("type") == "prompt":
+        return str(msg.get("voicePrompt", "")).strip()
+    return None
+
+async def say(ws: WebSocket, text: str):
+    await ws.send_json({
+        "type": "response",
+        "actions": [{
+            "say": text,
+            "barge": True,
+            "voice": {"name": TTS_VOICE, "provider": "amazon_polly"}
+        }]
+    })
+
+def normalize_phone(e164: str | None) -> str | None:
+    if not e164:
+        return None
+    # keep + and digits only
+    digits = re.sub(r"[^+0-9]", "", e164)
+    return digits or None
+
+# ---------- HTTP: /voice (Twilio hits this) ----------
 @app.post("/voice")
 async def voice(_: Request):
-    # Tell Twilio to open a WebSocket to our /relay endpoint and use Amazon Joanna
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay
       url="{RELAY_WSS_URL}"
-      ttsProvider="Amazon"
-      voice="Joanna-Neural"
-      interruptible="any"
-      reportInputDuringAgentSpeech="speech"
       welcomeGreeting="Hi, I’m Chloe. How can I help?"
     />
   </Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="text/xml")
 
-# optional sanity endpoints
 @app.get("/")
 async def index():
     return PlainTextResponse("OK")
@@ -45,73 +87,77 @@ async def index():
 async def health():
     return JSONResponse({"status": "ok"})
 
-# ---------- WebSocket: Twilio connects here ----------
+# ---------- WebSocket: /relay (Twilio connects here) ----------
 @app.websocket("/relay")
 async def relay(ws: WebSocket):
     await ws.accept()
-    print("ConversationRelay: connected", flush=True)
+    print("ConversationRelay: connected")
 
-    # tiny rolling history for coherence (kept short for latency)
+    # rolling history for coherence without growing unbounded
     history: list[dict] = []
+
+    caller_number: str | None = None
 
     try:
         while True:
             msg = await ws.receive_json()
-            mtype = msg.get("type")
-
-            # Twilio sends this once at call start
-            if mtype == "setup":
-                # We already send a welcome via TwiML, so do nothing here.
+            if isinstance(msg, dict) and msg.get("type") == "setup":
+                caller_number = normalize_phone(msg.get("from"))
                 continue
 
-            # Recognized speech from caller
-            if mtype == "prompt":
-                user_text = (msg.get("voicePrompt") or "").strip()
-                if not user_text:
-                    continue
-                print("RX:", user_text, flush=True)
+            text = extract_text(msg)
+            if not text:
+                continue
 
-                # Call OpenAI (fast model)
+            print("RX:", text)
+
+            # Very simple booking intent matcher
+            want_booking = bool(re.search(r"book|appointment|schedule|set up|meeting", text, re.I))
+
+            if want_booking and BOOKING_URL_BASE and twilio_client and caller_number:
+                # Text the booking link to the caller
                 try:
-                    resp = client.responses.create(
-                        model="gpt-4o-mini",
-                        input=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            *history[-6:],  # last 3 turns (user+assistant)
-                            {"role": "user", "content": user_text},
-                        ],
-                        max_output_tokens=180,
-                        temperature=0.3,
+                    link = BOOKING_URL_BASE
+                    twilio_client.messages.create(
+                        from_=TWILIO_MESSAGING_FROM,
+                        to=caller_number,
+                        body=f"Hi, this is Chloe from Foreclosure Relief Group. "
+                             f"Please choose a time here: {link}"
                     )
-                    ai_text = (resp.output_text or "").strip()
-                    if not ai_text:
-                        ai_text = "Sorry, could you repeat that?"
-                except Exception as e:
-                    print("OpenAI error:", repr(e), flush=True)
-                    ai_text = "I’m having trouble right now. Please say that again."
-
-                print("TX:", ai_text, flush=True)
-
-                # keep short context
-                history.append({"role": "user", "content": user_text})
-                history.append({"role": "assistant", "content": ai_text})
-
-                # ✅ Correct frame for Conversation Relay: send plain text
-                await ws.send_json({
-                    "type": "text",
-                    "token": ai_text,
-                    "last": True
-                })
+                    await say(ws, "Got it. I just texted you our booking link. "
+                                  "You can pick a time that works best. "
+                                  "Do you want me to stay on the line while you look, or answer anything else?")
+                except Exception as sms_err:
+                    print("SMS error:", sms_err)
+                    await say(ws, "I tried to text the booking link but hit a snag. "
+                                  "Would you like me to read the link out loud?")
                 continue
 
-            if mtype == "interrupt":
-                print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                continue
+            # ---- OpenAI Responses (text-in → text-out) ----
+            try:
+                resp = client.responses.create(
+                    model="gpt-4o-mini",
+                    input=[
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        *history[-6:],  # last 3 turns (user+assistant pairs)
+                        {"role": "user", "content": text},
+                    ],
+                    max_output_tokens=180,
+                )
+                ai_text = resp.output_text.strip()
+            except Exception as e:
+                print("OpenAI error:", e)
+                ai_text = "Sorry, I had trouble retrieving that. Could you please repeat or ask another way?"
 
-            if mtype == "error":
-                print("ConversationRelay error:", msg.get("description"), flush=True)
-                continue
+            print("TX:", ai_text)
 
-            # ignore other frame types
+            # update short history
+            history.append({"role": "user", "content": text})
+            history.append({"role": "assistant", "content": ai_text})
+
+            await say(ws, ai_text)
+
     except WebSocketDisconnect:
-        print("ConversationRelay: disconnected", flush=True)
+        print("ConversationRelay: disconnected")
+    finally:
+        await ws.close()
