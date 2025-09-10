@@ -1,23 +1,28 @@
 import os
 import re
-import json
-import httpx
 from datetime import datetime, timezone
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from openai import OpenAI
 from twilio.rest import Client as TwilioRest
+from starlette.websockets import WebSocketState
 
 # ---- Env & clients ----
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
-RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL")  # wss://.../relay  (Render env)
-TTS_VOICE = os.environ.get("TTS_VOICE", "Joanna-Neural")           # Amazon Polly voice name
-CALCOM_USERNAME = os.environ.get("CALCOM_USERNAME", "")            # e.g., 'foreclosure-relief'
-CALCOM_EVENT_SLUG = os.environ.get("CALCOM_EVENT_SLUG", "")        # e.g., 'consultation-15'
-BOOKING_URL_BASE = os.environ.get("CALCOM_BOOKING_URL") or (f"https://cal.com/{CALCOM_USERNAME}/{CALCOM_EVENT_SLUG}" if CALCOM_USERNAME and CALCOM_EVENT_SLUG else None)
+RELAY_WSS_URL  = os.environ.get("RELAY_WSS_URL")  # wss://.../relay  (Render env)
 
-TWILIO_ACCOUNT_SID = os.environ.get("TWILIO_ACCOUNT_SID")
-TWILIO_AUTH_TOKEN = os.environ.get("TWILIO_AUTH_TOKEN")
+# Use Twilio Polly voice. Default to 'Polly.Joanna-Neural' to avoid male fallback.
+TTS_VOICE = os.environ.get("TTS_VOICE", "Polly.Joanna-Neural")
+
+CALCOM_USERNAME   = os.environ.get("CALCOM_USERNAME", "")     # e.g., 'foreclosure-relief'
+CALCOM_EVENT_SLUG = os.environ.get("CALCOM_EVENT_SLUG", "")   # e.g., 'consultation-15'
+BOOKING_URL_BASE  = os.environ.get("CALCOM_BOOKING_URL") or (
+    f"https://cal.com/{CALCOM_USERNAME}/{CALCOM_EVENT_SLUG}"
+    if CALCOM_USERNAME and CALCOM_EVENT_SLUG else None
+)
+
+TWILIO_ACCOUNT_SID    = os.environ.get("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN     = os.environ.get("TWILIO_AUTH_TOKEN")
 TWILIO_MESSAGING_FROM = os.environ.get("TWILIO_MESSAGING_FROM")  # your SMS-enabled Twilio number
 
 if not OPENAI_API_KEY:
@@ -40,6 +45,21 @@ SYSTEM_PROMPT = (
 
 app = FastAPI()
 
+def build_say(text: str) -> dict:
+    """Conversation Relay response payload using current action schema."""
+    tts_voice = os.environ.get("TTS_VOICE", "Polly.Joanna-Neural")
+    return {
+        "type": "response",
+        "actions": [{
+            "type": "say",
+            "params": {
+                "text": text,
+                "barge": True,
+                "voice": {"name": tts_voice}
+            }
+        }]
+    }
+
 def extract_text(msg: dict) -> str | None:
     # ConversationRelay prompt frames look like: {'type':'prompt','voicePrompt':'text',...}
     if not isinstance(msg, dict):
@@ -49,14 +69,8 @@ def extract_text(msg: dict) -> str | None:
     return None
 
 async def say(ws: WebSocket, text: str):
-    await ws.send_json({
-        "type": "response",
-        "actions": [{
-            "say": text,
-            "barge": True,
-            "voice": {"name": TTS_VOICE, "provider": "amazon_polly"}
-        }]
-    })
+    # Send a 'response' frame with a single 'say' action
+    await ws.send_json(build_say(text))
 
 def normalize_phone(e164: str | None) -> str | None:
     if not e164:
@@ -68,11 +82,14 @@ def normalize_phone(e164: str | None) -> str | None:
 # ---------- HTTP: /voice (Twilio hits this) ----------
 @app.post("/voice")
 async def voice(_: Request):
+    tts_voice = os.environ.get("TTS_VOICE", "Polly.Joanna-Neural")
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
     <ConversationRelay
       url="{RELAY_WSS_URL}"
+      ttsProvider="polly"
+      voice="{tts_voice}"
       welcomeGreeting="Hi, I’m Chloe. How can I help?"
     />
   </Connect>
@@ -91,7 +108,7 @@ async def health():
 @app.websocket("/relay")
 async def relay(ws: WebSocket):
     await ws.accept()
-    print("ConversationRelay: connected")
+    print("ConversationRelay: connected", flush=True)
 
     # rolling history for coherence without growing unbounded
     history: list[dict] = []
@@ -101,6 +118,8 @@ async def relay(ws: WebSocket):
     try:
         while True:
             msg = await ws.receive_json()
+
+            # capture caller number once
             if isinstance(msg, dict) and msg.get("type") == "setup":
                 caller_number = normalize_phone(msg.get("from"))
                 continue
@@ -109,10 +128,10 @@ async def relay(ws: WebSocket):
             if not text:
                 continue
 
-            print("RX:", text)
+            print("RX:", text, flush=True)
 
             # Very simple booking intent matcher
-            want_booking = bool(re.search(r"book|appointment|schedule|set up|meeting", text, re.I))
+            want_booking = bool(re.search(r"\b(book|appointment|schedule|set up|meeting)\b", text, re.I))
 
             if want_booking and BOOKING_URL_BASE and twilio_client and caller_number:
                 # Text the booking link to the caller
@@ -121,16 +140,24 @@ async def relay(ws: WebSocket):
                     twilio_client.messages.create(
                         from_=TWILIO_MESSAGING_FROM,
                         to=caller_number,
-                        body=f"Hi, this is Chloe from Foreclosure Relief Group. "
-                             f"Please choose a time here: {link}"
+                        body=(
+                            "Hi, this is Chloe from Foreclosure Relief Group. "
+                            f"Please choose a time here: {link}"
+                        ),
                     )
-                    await say(ws, "Got it. I just texted you our booking link. "
-                                  "You can pick a time that works best. "
-                                  "Do you want me to stay on the line while you look, or answer anything else?")
+                    await say(
+                        ws,
+                        "Got it. I just texted you our booking link. "
+                        "You can pick a time that works best. "
+                        "Do you want me to stay on the line while you look, or answer anything else?",
+                    )
                 except Exception as sms_err:
-                    print("SMS error:", sms_err)
-                    await say(ws, "I tried to text the booking link but hit a snag. "
-                                  "Would you like me to read the link out loud?")
+                    print("SMS error:", sms_err, flush=True)
+                    await say(
+                        ws,
+                        "I tried to text the booking link but hit a snag. "
+                        "Would you like me to read the link out loud?",
+                    )
                 continue
 
             # ---- OpenAI Responses (text-in → text-out) ----
@@ -143,13 +170,19 @@ async def relay(ws: WebSocket):
                         {"role": "user", "content": text},
                     ],
                     max_output_tokens=180,
+                    temperature=0.3,
                 )
-                ai_text = resp.output_text.strip()
+                ai_text = (resp.output_text or "").strip()
+                if not ai_text:
+                    ai_text = "Sorry, could you repeat that?"
             except Exception as e:
-                print("OpenAI error:", e)
-                ai_text = "Sorry, I had trouble retrieving that. Could you please repeat or ask another way?"
+                print("OpenAI error:", e, flush=True)
+                ai_text = (
+                    "Sorry, I had trouble retrieving that. "
+                    "Could you please repeat or ask another way?"
+                )
 
-            print("TX:", ai_text)
+            print("TX:", ai_text, flush=True)
 
             # update short history
             history.append({"role": "user", "content": text})
@@ -158,6 +191,10 @@ async def relay(ws: WebSocket):
             await say(ws, ai_text)
 
     except WebSocketDisconnect:
-        print("ConversationRelay: disconnected")
+        print("ConversationRelay: disconnected", flush=True)
     finally:
-        await ws.close()
+        try:
+            if ws.client_state not in (WebSocketState.CLOSING, WebSocketState.DISCONNECTED):
+                await ws.close(code=1000)
+        except Exception:
+            pass
