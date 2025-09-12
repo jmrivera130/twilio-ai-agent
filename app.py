@@ -304,14 +304,14 @@ async def relay(ws: WebSocket):
 
                 # ---------- normal chat via OpenAI ----------
                 try:
-                    resp = client.chat.completions.create(
+                    resp = client.responses.create(
                         model="gpt-4o-mini",
-                        messages=[
+                        input=[
                             {"role": "system", "content": SYSTEM_PROMPT},
                             *history[-6:],  # last 3 turns (user+assistant)
                             {"role": "user", "content": user_text},
                         ],
-                        max_tokens=180,  # Note: `max_tokens` is the correct parameter name
+                        max_output_tokens=180,
                         temperature=0.3,
                     )
                     ai_text = (resp.output_text or "").strip()
