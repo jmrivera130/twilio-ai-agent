@@ -92,15 +92,18 @@ def save_booking(start_dt: datetime, caller_number: str | None,
         "name": (name or "").strip(),
         "address": (address or "").strip(),
         "note": note,
-        "gcal_link": gcal_link or ""
+        "calendar_link": ""
     }
     # Store under the APPOINTMENT DATE so /reports/YYYY-MM-DD shows that day’s bookings
-    _write_jsonl_for_day(start_dt.date(), rec)
+    
     # also write ICS for download
     ics_text = make_ics(rec["id"], start_dt, end_dt,
                         "Foreclosure Relief Consultation",
                         f"Caller: {caller_number or 'unknown'}; Name: {rec['name']}; Address: {rec['address']}")
     (ICS_DIR / f"{rec['id']}.ics").write_text(ics_text, encoding="utf-8")
+    # Set calendar link preference (Google link else ICS download)
+    rec["calendar_link"] = gcal_link or f"/ics/{rec['id']}.ics"
+    _write_jsonl_for_day(start_dt.date(), rec)
     return rec
 
 def save_optout(caller_number: str | None, name: str | None, address: str | None, note: str = "DNC request"):
@@ -115,7 +118,7 @@ def save_optout(caller_number: str | None, name: str | None, address: str | None
         "name": (name or "").strip(),
         "address": (address or "").strip(),
         "note": note,
-        "gcal_link": ""
+        "calendar_link": ""
     }
     # Store under TODAY so today's report contains DNCs from today
     _write_jsonl_for_day(now_local.date(), rec)
@@ -123,7 +126,7 @@ def save_optout(caller_number: str | None, name: str | None, address: str | None
 
 def render_report_csv(day: date) -> str:
     # Unified header for both booking & optout records
-    header = ["id","type","created_at","start","end","caller","name","address","note","gcal_link"]
+    header = ["id","type","created_at","start","end","caller","name","address","note","calendar_link"]
     p = _day_path(day)
     rows = []
     if p.exists():
@@ -140,7 +143,7 @@ def render_report_csv(day: date) -> str:
                     j.get("name","") or "",
                     j.get("address","") or "",
                     j.get("note","") or "",
-                    j.get("gcal_link","") or "",
+                    j.get("calendar_link","") or "",
                 ])
             except Exception:
                 continue
@@ -277,8 +280,11 @@ def parse_time_phrase(text: str) -> time | None:
         return time(12, 0)
     if "midnight" in s:
         return time(0, 0)
-    # forms like 12, 12pm, 12:30pm, 12:30
-    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?)?\b", s2)
+    # forms like "at 12", "12", "12pm", "12:30pm", "12:30"
+    m = re.search(r"\b(?:at\s*)?(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?)?\b", s)
+    if not m:
+        # also allow glued forms when spaces are removed (e.g., "at1pm")
+        m = re.search(r"(?:^|[^0-9])(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?)?(?:$|[^0-9])", s2)
     if not m:
         return None
     hour = int(m.group(1))
@@ -323,6 +329,33 @@ def maybe_extract_address(text: str) -> str | None:
     if m2:
         return m2.group(0).strip()
     return None
+
+def maybe_extract_phone(text: str) -> str | None:
+    # Pull out a plausible phone number from free text
+    digits = re.sub(r"\D+", "", text or "")
+    if 10 <= len(digits) <= 15:
+        # normalize US 10-digit to +1XXXXXXXXXX if likely
+        if len(digits) == 10:
+            return "+1" + digits
+        if digits.startswith("1") and len(digits) == 11:
+            return "+" + digits
+        if digits.startswith("+"):
+            return digits
+        return "+" + digits
+    return None
+
+def _tz_label(dt: datetime) -> str:
+    # Prefer friendly region for America/Los_Angeles
+    try:
+        if "Los_Angeles" in BUSINESS_TZ:
+            return "Pacific"
+        # fallback to zone abbreviation like PST/PDT
+        return dt.tzname() or BUSINESS_TZ
+    except Exception:
+        return BUSINESS_TZ
+
+def when_phrase(dt: datetime) -> str:
+    return f"{dt.strftime('%A, %B %d, %I:%M %p')} {_tz_label(dt)}"
 
 
 # ---------- HTTP: Twilio hits /voice ----------
@@ -414,7 +447,8 @@ async def relay(ws: WebSocket):
         "hold_time": None,     # time obj
         "hold_dt": None,       # datetime obj
         "hold_name": None,     # str
-        "hold_address": None   # str
+        "hold_address": None,  # str
+        "hold_phone": None     # str (fallback if caller id missing)
     }
 
     try:
@@ -440,6 +474,24 @@ async def relay(ws: WebSocket):
                 if history and history[-1].get("role") == "assistant":
                     last_ai = history[-1].get("content", "").lower()
 
+                # Caller asked to clarify the exact date/time
+                if re.search(r"\b(what\s+(date|day)\s+is\s+that|which\s+day\s+is\s+that|what\s+date\s+would\s+that\s+be|what\s+day\s+would\s+that\s+be)\b", text, re.I):
+                    if state.get("hold_dt"):
+                        await send_text(ws, when_phrase(state["hold_dt"]))
+                        continue
+                    elif state.get("hold_date") and state.get("hold_time"):
+                        dt_tmp = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+                        await send_text(ws, when_phrase(dt_tmp))
+                        continue
+                    elif state.get("hold_date"):
+                        d = state["hold_date"]
+                        phr = f"{d.strftime('%A, %B %d')} {_tz_label(datetime.now(TZ))}"
+                        await send_text(ws, phr)
+                        continue
+                    else:
+                        await send_text(ws, "I can confirm the exact date and time once we pick a day and time.")
+                        continue
+
                 # -------- global: detect Opt-Out at any time --------
                 if OPT_OUT_RE.search(text):
                     state.update({"mode": "optout"})
@@ -451,8 +503,14 @@ async def relay(ws: WebSocket):
                         state["need"] = "address"
                         await send_text(ws, "Thanks. What’s the property address to stop contacting?")
                         continue
-                    state["need"] = "confirm"
-                    await send_text(ws, f"Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {caller_number}. Is that correct?")
+                    # ensure we have a phone number; ask if caller ID missing
+                    if not caller_number and not state["hold_phone"]:
+                        state["need"] = "phone"
+                        await send_text(ws, "What�?Ts the best number to reach you?")
+                    else:
+                        state["need"] = "confirm"
+                        ph = state["hold_phone"] or caller_number
+                        await send_text(ws, f"Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {ph}. Is that correct?")
                     continue
 
                 # -------- handle ongoing optout flow --------
@@ -473,18 +531,35 @@ async def relay(ws: WebSocket):
                             await send_text(ws, "Could you repeat the property address?")
                             continue
                         state["hold_address"] = addr
+                        # if we don't have a phone number, ask for it
+                        if not caller_number and not state["hold_phone"]:
+                            state["need"] = "phone"
+                            await send_text(ws, "What�?Ts the best number to reach you?")
+                        else:
+                            state["need"] = "confirm"
+                            ph = state["hold_phone"] or caller_number
+                            await send_text(ws, f"Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {ph}. Is that correct?")
+                        continue
+
+                    if state["need"] == "phone":
+                        ph = maybe_extract_phone(text)
+                        if not ph:
+                            await send_text(ws, "Sorry, I didn’t catch that. What’s the best callback number?")
+                            continue
+                        state["hold_phone"] = ph
                         state["need"] = "confirm"
-                        await send_text(ws, f"Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {caller_number}. Is that correct?")
+                        await send_text(ws, f"Thanks. Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {ph}. Is that correct?")
                         continue
 
                     if state["need"] == "confirm":
                         if re.search(r"\b(yes|yeah|yep|correct|confirmed|that’s right|that is right|ok|okay)\b", text, re.I):
-                            rec = save_optout(caller_number, state["hold_name"], state["hold_address"])
-                            state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None}
+                            ph = state["hold_phone"] or caller_number
+                            rec = save_optout(ph, state["hold_name"], state["hold_address"])
+                            state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None, "hold_phone": None}
                             await send_text(ws, "All set — I’ve marked you as do-not-contact. Take care.")
                             continue
                         elif re.search(r"\b(no|nope|not|change|different|cancel)\b", text, re.I):
-                            state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None}
+                            state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None, "hold_phone": None}
                             await send_text(ws, "Okay. How else can I help?")
                             continue
                         else:
@@ -510,17 +585,25 @@ async def relay(ws: WebSocket):
                         addr_cap = maybe_extract_address(text)
                         if addr_cap:
                             state["hold_address"] = addr_cap
+                    if not caller_number and not state["hold_phone"]:
+                        ph_cap = maybe_extract_phone(text)
+                        if ph_cap:
+                            state["hold_phone"] = ph_cap
 
                 # -------- booking flow --------
                 if state["mode"] == "booking":
-                    # Fill what we can from this utterance
-                    d, t, dt = extract_datetime(text)
-                    if d:
-                        state["hold_date"] = d
-                    if t:
-                        state["hold_time"] = t
-                    if state["hold_date"] and state["hold_time"]:
-                        state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+                    # If awaiting confirmation, skip prompting here; handle below.
+                    if state.get("need") == "confirm":
+                        pass
+                    else:
+                        # Fill what we can from this utterance
+                        d, t, dt = extract_datetime(text)
+                        if d:
+                            state["hold_date"] = d
+                        if t:
+                            state["hold_time"] = t
+                        if state["hold_date"] and state["hold_time"]:
+                            state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
 
                     # ask in order: date -> time -> name -> address -> confirm
                     if not state["hold_date"]:
@@ -533,7 +616,7 @@ async def relay(ws: WebSocket):
                         continue
                     if not state["hold_name"]:
                         state["need"] = "name"
-                        when_say = state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                        when_say = when_phrase(state["hold_dt"])
                         await send_text(ws, f"Great — I have {when_say}. What’s your full name?")
                         continue
                     if not state["hold_address"]:
@@ -541,14 +624,20 @@ async def relay(ws: WebSocket):
                         await send_text(ws, "Thanks. What’s the property address?")
                         continue
 
-                    # confirm all details
-                    state["need"] = "confirm"
-                    when_say = state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
-                    await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
-                    continue
+                    # ensure we have a phone number
+                    if not caller_number and not state["hold_phone"]:
+                        state["need"] = "phone"
+                        await send_text(ws, "What’s the best number to reach you?")
+                        continue
+
+                        # confirm all details
+                        state["need"] = "confirm"
+                        when_say = when_phrase(state["hold_dt"])
+                        await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
+                        continue
 
                 # -------- respond normally if not in a flow --------
-                if not want_booking and state["mode"] is None:
+                if state["mode"] is None:
                     try:
                         resp = client.responses.create(
                             model="gpt-4o-mini",
@@ -577,6 +666,7 @@ async def relay(ws: WebSocket):
                 if state["mode"] == "booking" and state["need"] == "confirm":
                     if re.search(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|ok|okay)\b", text, re.I):
                         start_dt = state["hold_dt"]
+                        phone_used = state["hold_phone"] or caller_number
                         g_link = None
                         # Optional Google Calendar push
                         if HAVE_GCAL and os.environ.get("GOOGLE_CALENDAR_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
@@ -584,13 +674,13 @@ async def relay(ws: WebSocket):
                                 "Foreclosure Relief Consultation",
                                 start_dt,
                                 start_dt + timedelta(minutes=30),
-                                description=f"Caller: {caller_number or 'unknown'}; Name: {state['hold_name']}; Address: {state['hold_address']}",
+                                description=f"Caller: {phone_used or 'unknown'}; Name: {state['hold_name']}; Address: {state['hold_address']}",
                             )
                             if g.get("ok"):
                                 g_link = g.get("htmlLink")
-                        rec = save_booking(start_dt, caller_number, state["hold_name"], state["hold_address"], gcal_link=g_link)
-                        when_say = start_dt.strftime("%A %B %d at %I:%M %p %Z")
-                        state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None}
+                        rec = save_booking(start_dt, phone_used, state["hold_name"], state["hold_address"], gcal_link=g_link)
+                        when_say = when_phrase(start_dt)
+                        state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None, "hold_phone": None}
                         if g_link:
                             await send_text(ws, f"All set — booked for {when_say}. I’ve added it to the calendar.")
                         else:
@@ -636,6 +726,12 @@ async def relay(ws: WebSocket):
                             await send_text(ws, "Could you repeat the property address?")
                             continue
                         state["hold_address"] = addr
+                    elif state["need"] == "phone":
+                        ph = maybe_extract_phone(text)
+                        if not ph:
+                            await send_text(ws, "Sorry, I didn’t catch that. What’s the best callback number?")
+                            continue
+                        state["hold_phone"] = ph
 
                     # after filling, proceed down the chain again
                     if not state["hold_date"]:
@@ -645,15 +741,19 @@ async def relay(ws: WebSocket):
                         await send_text(ws, "What time should I book? (e.g., 12 PM)")
                         continue
                     if not state["hold_name"]:
-                        when_say = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ).strftime("%A %B %d at %I:%M %p %Z")
+                        when_say = when_phrase(datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ))
                         await send_text(ws, f"Great — I have {when_say}. What’s your full name?")
                         continue
                     if not state["hold_address"]:
                         await send_text(ws, "Thanks. What’s the property address?")
                         continue
                     state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+                    if not caller_number and not state["hold_phone"]:
+                        await send_text(ws, "What’s the best number to reach you?")
+                        state["need"] = "phone"
+                        continue
                     state["need"] = "confirm"
-                    when_say = state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                    when_say = when_phrase(state["hold_dt"])
                     await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
                     continue
 
