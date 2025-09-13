@@ -302,6 +302,28 @@ def extract_datetime(text: str):
     if d and t:
         return d, t, datetime.combine(d, t, tzinfo=TZ)
     return d, t, None
+# ---------- helpers: booking & opt-out detection ----------
+BOOKING_KEYWORDS_RE = re.compile(r"\b(book|appointment|schedule|set up|meeting|consult)\b", re.I)
+YES_RE = re.compile(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|ok|okay)\b", re.I)
+SCHEDULING_HINT_RE = re.compile(r"\b(schedule|book|appointment|set up|consult)\b", re.I)
+
+def maybe_extract_name(text: str) -> str | None:
+    m = re.search(r"\b(my name is|this is)\s+([A-Za-z][A-Za-z\.\-'\s]{1,60})\b", text, re.I)
+    if m:
+        return m.group(2).strip(" .,'-")
+    return None
+
+def maybe_extract_address(text: str) -> str | None:
+    m = re.search(r"\b(?:address|property address|the address)\s*(?:is|:)?\s*(.+)", text, re.I)
+    if m:
+        addr = m.group(1).strip()
+        if len(addr) >= 4:
+            return addr
+    m2 = re.search(r"\b\d{2,6}\s+[A-Za-z0-9][A-Za-z0-9\s\.\-']{3,}\b", text)
+    if m2:
+        return m2.group(0).strip()
+    return None
+
 
 # ---------- HTTP: Twilio hits /voice ----------
 @app.post("/voice")
@@ -413,6 +435,11 @@ async def relay(ws: WebSocket):
                 print("RX:", user_text, flush=True)
                 text = user_text
 
+                # prior assistant line (to catch "Yes" after assistant suggested scheduling)
+                last_ai = ""
+                if history and history[-1].get("role") == "assistant":
+                    last_ai = history[-1].get("content", "").lower()
+
                 # -------- global: detect Opt-Out at any time --------
                 if OPT_OUT_RE.search(text):
                     state.update({"mode": "optout"})
@@ -465,10 +492,24 @@ async def relay(ws: WebSocket):
                             continue
 
                 # -------- booking: detect intent --------
-                want_booking = bool(re.search(r"\b(book|appointment|schedule|set up|meeting|consult)\b", text, re.I))
-                if state["mode"] is None and want_booking:
+                d, t, dt = extract_datetime(text)
+                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(text))
+                yes_after_schedule = bool(YES_RE.search(text) and SCHEDULING_HINT_RE.search(last_ai))
+                datetime_implies_booking = bool(d or t)
+                if state["mode"] is None and (booking_keyword or yes_after_schedule or datetime_implies_booking):
                     state["mode"] = "booking"
                     # fall through to normal booking flow
+
+                # Passive capture (works in booking/optout): name/address
+                if state["mode"] in ("booking", "optout"):
+                    if not state["hold_name"]:
+                        nm_cap = maybe_extract_name(text)
+                        if nm_cap:
+                            state["hold_name"] = nm_cap
+                    if not state["hold_address"]:
+                        addr_cap = maybe_extract_address(text)
+                        if addr_cap:
+                            state["hold_address"] = addr_cap
 
                 # -------- booking flow --------
                 if state["mode"] == "booking":
