@@ -136,7 +136,7 @@ async def cal_create_booking(start_iso: str, name: str, phone: str | None, durat
         bid = (j.get("data") or {}).get("id") or (j.get("data") or {}).get("uid")
         return {"ok": True, "id": str(bid), "data": j.get("data")}
     return {"ok": False, "error": j.get("error", {}).get("message") or j.get("message") or str(j)}
-BOOK_RE = re.compile(r'BOOK_JSON:\s*(\{.*\})', re.IGNORECASE | re.DOTALL)
+BOOK_RE = re.compile(r'BOOK_JSON:\s*(\{.*?\})', re.IGNORECASE | re.DOTALL)
 
 def extract_booking(json_line: str) -> dict | None:
     m = BOOK_RE.search(json_line)
@@ -303,59 +303,112 @@ async def relay(ws: WebSocket):
                     continue
 
                 # ---------- normal chat via OpenAI ----------
+
                 try:
+
                     resp = client.responses.create(
+
                         model="gpt-4o-mini",
+
                         input=[
+
                             {"role": "system", "content": SYSTEM_PROMPT},
+
                             *history[-6:],  # last 3 turns (user+assistant)
+
                             {"role": "user", "content": user_text},
+
                         ],
+
                         max_output_tokens=180,
+
                         temperature=0.3,
+
                     )
-ai_text_raw = (resp.output_text or "").strip()
+
+                    ai_text_raw = (resp.output_text or "").strip()
+
+                    # Look for BOOK_JSON anywhere in the assistant text
+
                     book = extract_booking(ai_text_raw)
+
                     if book and "YYYY" not in book.get("start",""):
+
+                        # remove the BOOK_JSON line from what the caller hears
+
                         ai_text = BOOK_RE.sub("", ai_text_raw).strip() or "Got it."
+
                         try:
+
                             req_local = dateparse.parse(book["start"])
+
                             if req_local.tzinfo is None:
+
                                 req_local = req_local.replace(tzinfo=ZoneInfo(CAL_TZ))
+
                             day_start = req_local.date().isoformat()
+
                             day_end   = (req_local.date() + timedelta(days=1)).isoformat()
+
                             slots = await cal_get_slots(day_start, day_end)
+
                             wanted_ok = any(s.startswith(req_local.isoformat()[:16]) for s in slots)
+
                             if not wanted_ok and slots:
+
                                 ai_text = (ai_text + "\n" if ai_text else "") + f"That time isn’t available. Next openings are {slots[0]} or {slots[1]}. Which works?"
+
                             else:
+
                                 res = await cal_create_booking(
+
                                     req_local.isoformat(),
+
                                     name=book["name"],
+
                                     phone=state.get("caller_phone"),
+
                                 )
-                                if res["ok"]:
+
+                                if res.get("ok"):
+
                                     when_say = req_local.strftime("%A %b %d at %I:%M %p")
+
                                     ai_text = (ai_text + "\n" if ai_text else "") + f"All set — you’re booked for {when_say}."
+
                                 else:
-                                    ai_text = (ai_text + "\n" if ai_text else "") + f"Sorry, I couldn’t finalize that: {res['error']}."
+
+                                    ai_text = (ai_text + "\n" if ai_text else "") + f"Sorry, I couldn’t finalize that: {res.get('error')}."
+
                         except Exception:
+
                             ai_text = (ai_text + "\n" if ai_text else "") + "I couldn’t parse that time. Could you say the date and time again, like ‘Tuesday at 2 PM’?"
+
                     else:
+
                         ai_text = ai_text_raw or "Sorry, could you repeat that?"
 
                 except Exception as e:
+
                     print("OpenAI error:", repr(e), flush=True)
+
                     ai_text = "I’m having trouble right now. Please say that again."
+
 
                 print("TX:", ai_text, flush=True)
 
+
                 # keep short context
+
                 history.append({"role": "user", "content": user_text})
+
                 history.append({"role": "assistant", "content": ai_text})
 
+
                 await send_text(ws, ai_text)
+
                 continue
+
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
