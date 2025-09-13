@@ -1,149 +1,266 @@
-# app.py — FastAPI + Twilio Conversation Relay + OpenAI Responses (text frames)
-# + Cal.com v2 in-call booking (Option B)
+# app.py — FastAPI + Twilio Conversation Relay + OpenAI (fallback)
+# Local bookings (JSONL) + CSV reports + ICS downloads + optional Google Calendar
+# No Cal.com. Timezone-aware and low-latency.
 
 import os
 import re
 import json
-import asyncio
-import httpx
+import uuid
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
+from pathlib import Path
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
 from fastapi.responses import PlainTextResponse, JSONResponse
 from openai import OpenAI
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
-from dateutil import parser as dateparse
+
 # ---------- required env ----------
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]   # wss://<your-app>.onrender.com/relay
 
-# Cal.com (add these in Render dashboard > Environment)
-CAL_TOKEN      = os.environ.get("CALCOM_API_TOKEN")       # required for booking
-CAL_USERNAME   = os.environ.get("CALCOM_USERNAME")        # required
-CAL_EVENT_SLUG = os.environ.get("CALCOM_EVENT_SLUG")      # required
-CAL_TZ         = os.environ.get("CALCOM_TIMEZONE", "America/Los_Angeles")
+# Business timezone (for parsing & storage)
+BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
+TZ = ZoneInfo(BUSINESS_TZ)
+
+# Storage dirs
+BOOK_DIR   = Path(os.environ.get("BOOK_DIR", "/tmp/appointments"))
+REPORT_DIR = Path(os.environ.get("REPORT_DIR", "/tmp/reports"))
+ICS_DIR    = Path(os.environ.get("ICS_DIR", "/tmp/ics"))
+BOOK_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
+ICS_DIR.mkdir(parents=True, exist_ok=True)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
 SYSTEM_PROMPT = (
     "You are Chloe from Foreclosure Relief Group. Be warm, concise, and clear. "
-    "Prefer 1–3 short sentences. Avoid filler. Offer more detail only if asked. "
-    "If the caller wants to book, confirm the day/time and keep the language short."
-    "\n\nWhen the caller explicitly confirms a date and time for an appointment, "
-    "append ONE final line in EXACTLY this format (JSON on one line):\n"
-    "BOOK_JSON: {\"start\":\"YYYY-MM-DDTHH:MM\", \"name\":\"Caller Name\"}\n"
-    "Use the caller’s local time in the business timezone. "
-    "Do not output BOOK_JSON until the caller has clearly confirmed both date and time."
+    "Prefer 1–3 short sentences. Avoid filler. Offer more detail only if asked."
 )
 
-# ---------- small helpers ----------
-def normalize_phone(e164: str | None) -> str | None:
-    if not e164:
-        return None
-    return re.sub(r"[^+0-9]", "", e164) or None
-
+# ---------- utils ----------
 async def send_text(ws: WebSocket, text: str):
-    # Conversation Relay expects 'type':'text' frames for TTS
     await ws.send_json({"type": "text", "token": text, "last": True})
 
-# ---------- Cal.com v2 helpers ----------
-CAL_BASE = "https://api.cal.com/v2"
+def _day_path(d: date) -> Path:
+    return BOOK_DIR / f"{d.isoformat()}.jsonl"
 
-CAL_HEADERS = {
-    "Authorization": f"Bearer {CAL_TOKEN}" if CAL_TOKEN else "",
-    "cal-api-version": "2024-08-13",
-    "Content-Type": "application/json",
-}
+def _ics_dt(dt: datetime) -> str:
+    u = dt.astimezone(ZoneInfo("UTC"))
+    return u.strftime("%Y%m%dT%H%M%SZ")
 
-async def cal_get_slots(start_date: str, end_date: str) -> list[str]:
-    """
-    Return available slot starts (ISO strings) between start_date and end_date (YYYY-MM-DD).
-    Uses eventTypeSlug + username + timeZone.
-    """
-    if not (CAL_TOKEN and CAL_USERNAME and CAL_EVENT_SLUG):
-        return []
-    url = "https://api.cal.com/v2/slots"
-    params = {
-        "username": CAL_USERNAME,
-        "eventTypeSlug": CAL_EVENT_SLUG,
-        "start": start_date,
-        "end": end_date,
-        "timeZone": CAL_TZ,
-    }
-    async with httpx.AsyncClient(timeout=15) as x:
-        r = await x.get(url, headers=CAL_HEADERS, params=params)
-    try:
-        j = r.json()
-    except Exception:
-        return []
-    if r.status_code == 200 and j.get("status") == "success":
-        out = []
-        for _day, arr in (j.get("data") or {}).items():
-            for it in arr or []:
-                if "start" in it:
-                    out.append(it["start"])
-        return out
-    return []
+def make_ics(uid: str, start_dt: datetime, end_dt: datetime, summary: str, description: str) -> str:
+    nowz = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//FRG//Chloe//EN",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+        "BEGIN:VEVENT",
+        f"UID:{uid}",
+        f"DTSTAMP:{nowz}",
+        f"DTSTART:{_ics_dt(start_dt)}",
+        f"DTEND:{_ics_dt(end_dt)}",
+        f"SUMMARY:{summary}",
+        f"DESCRIPTION:{description}",
+        "END:VEVENT",
+        "END:VCALENDAR",
+        ""
+    ]
+    return "\r\n".join(lines)
 
-async def cal_create_booking(start_iso: str, name: str, phone: str | None, duration_min: int = 30):
-    """
-    POST /v2/bookings to actually create the meeting.
-    Returns dict: {"ok": bool, "id": "...", "error": "..."}
-    """
-    if not (CAL_TOKEN and CAL_USERNAME and CAL_EVENT_SLUG):
-        return {"ok": False, "error": "Missing Cal.com env vars"}
-    # normalize start in org TZ and compute end
-    start_dt = dateparse.parse(start_iso)
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=ZoneInfo(CAL_TZ))
+def save_appointment(start_dt: datetime, caller_number: str | None, note: str = "Consultation", duration_min: int = 30):
     end_dt = start_dt + timedelta(minutes=duration_min)
-
-    payload = {
-        "eventTypeSlug": CAL_EVENT_SLUG,
-        "username": CAL_USERNAME,
+    rec = {
+        "id": uuid.uuid4().hex[:12],
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
-        "timeZone": CAL_TZ,
-        "durationInMinutes": duration_min,
-        "attendee": {
-            "name": name,
-            # email is optional if your event type doesn’t require it
-            **({"phoneNumber": phone} if phone else {}),
-        },
+        "caller": caller_number,
+        "note": note,
+        "created_at": datetime.now(ZoneInfo("UTC")).isoformat()
     }
-    url = "https://api.cal.com/v2/bookings"
-    async with httpx.AsyncClient(timeout=20) as x:
-        r = await x.post(url, headers=CAL_HEADERS, json=payload)
-    try:
-        j = r.json()
-    except Exception:
-        return {"ok": False, "error": f"HTTP {r.status_code}"}
-    if r.status_code == 200 and j.get("status") == "success":
-        bid = (j.get("data") or {}).get("id") or (j.get("data") or {}).get("uid")
-        return {"ok": True, "id": str(bid)}
-    return {"ok": False, "error": j.get("message") or str(j) }
+    p = _day_path(start_dt.date())
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # also write ICS for download
+    ics_text = make_ics(rec["id"], start_dt, end_dt, "Foreclosure Relief Consultation", f"Caller: {caller_number or 'unknown'}")
+    (ICS_DIR / f"{rec['id']}.ics").write_text(ics_text, encoding="utf-8")
+    return rec
 
-BOOK_RE = re.compile(r'BOOK_JSON:\s*(\{.*\})\s*$', re.IGNORECASE | re.DOTALL)
+def render_report_csv(day: date) -> str:
+    p = _day_path(day)
+    rows = []
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                j = json.loads(line)
+                rows.append([j.get("id",""), j.get("start",""), j.get("end",""), j.get("caller","") or "", j.get("note","") or ""])
+            except Exception:
+                continue
+    out = ["id,start,end,caller,note"]
+    for r in rows:
+        safe = ['"{}"'.format(str(x).replace('"','""')) for x in r]
+        out.append(",".join(safe))
+    return "\n".join(out)
 
-def extract_booking(json_line: str) -> dict | None:
-    m = BOOK_RE.search(json_line)
-    if not m:
-        return None
+# ---------- optional Google Calendar (service account) ----------
+# Add GOOGLE_SERVICE_ACCOUNT_JSON (full JSON string or path) and GOOGLE_CALENDAR_ID (e.g., your@gmail.com)
+try:
+    from google.oauth2 import service_account
+    from google.auth.transport.requests import Request as GoogleRequest
+    HAVE_GCAL = True
+except Exception:
+    service_account = None
+    GoogleRequest = None
+    HAVE_GCAL = False
+
+async def gcal_create_event(summary: str, start_dt: datetime, end_dt: datetime, description: str | None = None):
+    if not HAVE_GCAL:
+        return {"ok": False, "error": "google-auth not installed"}
+    cal_id = os.environ.get("GOOGLE_CALENDAR_ID")
+    if not cal_id:
+        return {"ok": False, "error": "GOOGLE_CALENDAR_ID not set"}
+    raw = os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON")
+    if not raw:
+        return {"ok": False, "error": "GOOGLE_SERVICE_ACCOUNT_JSON not set"}
     try:
-        data = json.loads(m.group(1))
-        # expect keys: start, name
-        if "start" in data and "name" in data:
-            return data
-    except Exception:
-        pass
+        # Load JSON (string or path)
+        if raw.strip().startswith("{"):
+            info = json.loads(raw)
+        else:
+            info = json.loads(Path(raw).read_text(encoding="utf-8"))
+        scopes = ["https://www.googleapis.com/auth/calendar"]
+        cred = service_account.Credentials.from_service_account_info(info, scopes=scopes)
+        cred.refresh(GoogleRequest())
+
+        import httpx
+        url = f"https://www.googleapis.com/calendar/v3/calendars/{cal_id}/events"
+        evt = {
+            "summary": summary,
+            "description": description or "",
+            "start": {"dateTime": start_dt.isoformat(), "timeZone": BUSINESS_TZ},
+            "end":   {"dateTime": end_dt.isoformat(),   "timeZone": BUSINESS_TZ},
+        }
+        headers = {"Authorization": f"Bearer {cred.token}", "Content-Type": "application/json"}
+        async with httpx.AsyncClient(timeout=20) as x:
+            r = await x.post(url, headers=headers, json=evt)
+        if r.status_code in (200, 201):
+            j = r.json()
+            return {"ok": True, "id": j.get("id"), "htmlLink": j.get("htmlLink")}
+        return {"ok": False, "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+    except Exception as e:
+        return {"ok": False, "error": repr(e)}
+
+# ---------- lightweight natural language date/time parsing ----------
+WEEKDAYS = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+MONTHS = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,"july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
+
+def _next_weekday(now_dt: datetime, target: int) -> date:
+    days_ahead = (target - now_dt.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return (now_dt + timedelta(days=days_ahead)).date()
+
+def parse_date_phrase(text: str, now_dt: datetime) -> date | None:
+    s = (text or "").lower()
+
+    # in N days
+    m = re.search(r"\bin\s+(\d+)\s+day[s]?\b", s)
+    if m:
+        return (now_dt + timedelta(days=int(m.group(1)))).date()
+
+    # today / tomorrow
+    if re.search(r"\btoday\b", s):
+        return now_dt.date()
+    if re.search(r"\btomorrow\b", s):
+        return (now_dt + timedelta(days=1)).date()
+
+    # weekday name
+    for name, idx in WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", s):
+            return _next_weekday(now_dt, idx)
+
+    # month name + day (e.g., September 15 / Sep 15)
+    m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})\b", s)
+    if m:
+        month_name = m.group(1)
+        mon = None
+        for full, num in MONTHS.items():
+            if full.startswith(month_name[:3]):
+                mon = num
+                break
+        day = int(m.group(2))
+        year = now_dt.year
+        try:
+            d = date(year, mon, day)
+            if d < now_dt.date():
+                d = date(year + 1, mon, day)
+            return d
+        except Exception:
+            pass
+
+    # numeric m/d or m-d
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", s)
+    if m:
+        mon, day = int(m.group(1)), int(m.group(2))
+        year = now_dt.year
+        try:
+            d = date(year, mon, day)
+            if d < now_dt.date():
+                d = date(year + 1, mon, day)
+            return d
+        except Exception:
+            pass
+
+    # ISO yyyy-mm-dd
+    m = re.search(r"\b(\d{4})-(\d{2})-(\d{2})\b", s)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except Exception:
+            pass
+
     return None
 
+def parse_time_phrase(text: str) -> time | None:
+    s = (text or "").lower().strip()
+    s2 = s.replace(" ", "")
+    # keywords
+    if "noon" in s:
+        return time(12, 0)
+    if "midnight" in s:
+        return time(0, 0)
+    # forms like 12, 12pm, 12:30pm, 12:30
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?)?\b", s2)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    ap = (m.group(3) or "").replace(".", "")
+    if ap == "pm" and hour != 12:
+        hour += 12
+    if ap == "am" and hour == 12:
+        hour = 0
+    if not ap and hour <= 7:
+        # Bare "6" likely evening
+        hour += 12
+    if hour > 23 or minute > 59:
+        return None
+    return time(hour, minute)
+
+def extract_datetime(text: str):
+    now_dt = datetime.now(TZ)
+    d = parse_date_phrase(text, now_dt)
+    t = parse_time_phrase(text)
+    if d and t:
+        return d, t, datetime.combine(d, t, tzinfo=TZ)
+    return d, t, None
 
 # ---------- HTTP: Twilio hits /voice ----------
 @app.post("/voice")
 async def voice(_: Request):
-    # Tell Twilio to open a WebSocket to our /relay endpoint (Amazon Polly voice happens on Twilio’s side)
+    # Tell Twilio to open a WebSocket to our /relay endpoint and use Amazon Joanna
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -164,24 +281,50 @@ async def voice(_: Request):
 async def index():
     return PlainTextResponse("OK")
 
-# NEW: respond 200 to Render/Twilio HEAD health probes (silences 405s)
-@app.head("/")
-async def index_head():
-    return Response(status_code=200)
-
+# Health alias + HEAD + favicon to quiet logs
 @app.get("/health")
 async def health():
     return JSONResponse({"status": "ok"})
 
-# NEW: healthz alias if you want to point Render's Health Check Path here
 @app.get("/healthz")
 async def healthz():
     return JSONResponse({"ok": True})
 
-# NEW: quiet favicon noise in logs
+@app.head("/")
+async def head_root():
+    return Response(status_code=200)
+
 @app.get("/favicon.ico")
 async def favicon():
     return Response(status_code=204)
+
+# ICS download
+@app.get("/ics/{bid}.ics")
+async def get_ics(bid: str):
+    p = ICS_DIR / f"{bid}.ics"
+    if p.exists():
+        return PlainTextResponse(p.read_text(encoding="utf-8"), media_type="text/calendar; charset=utf-8")
+    return Response(status_code=404)
+
+# Reports (CSV)
+@app.get("/reports/today")
+async def report_today():
+    d = datetime.now(TZ).date()
+    csv_text = render_report_csv(d)
+    fname = f"appointments-{d.isoformat()}.csv"
+    return PlainTextResponse(csv_text, media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
+
+@app.get("/reports/{day}")
+async def report_day(day: str):
+    try:
+        d = datetime.fromisoformat(day).date()
+    except Exception:
+        return JSONResponse({"error":"bad date"}, status_code=400)
+    csv_text = render_report_csv(d)
+    fname = f"appointments-{d.isoformat()}.csv"
+    return PlainTextResponse(csv_text, media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 # ---------- WebSocket: Twilio connects here ----------
 @app.websocket("/relay")
@@ -192,29 +335,25 @@ async def relay(ws: WebSocket):
     # tiny rolling history for coherence (kept short for latency)
     history: list[dict] = []
 
-    # booking state
-    state = {
-        "mode": "chat",         # "chat" or "pick"
-        "offered": [],          # list of ISO strings presented
-        "caller_name": None,    # optional future enhancement
-        "caller_phone": None,   # filled from setup frame
+    # caller + booking state
+    caller_number: str | None = None
+    booking_state = {
+        "need": None,          # None | "date" | "time" | "confirm"
+        "hold_date": None,     # date obj
+        "hold_time": None,     # time obj
+        "hold_dt": None        # datetime obj
     }
 
     try:
         while True:
-            raw = await ws.receive_text()
-            try:
-                msg = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-
+            msg = await ws.receive_json()
             mtype = msg.get("type")
 
-            # Twilio sends this once at call start with caller info
+            # Twilio sends this once at call start
             if mtype == "setup":
-                state["caller_phone"] = normalize_phone(msg.get("from"))
+                # Capture caller number if available
+                caller_number = (msg.get("from") or "").strip() or None
                 continue
-
 
             # Recognized speech from caller
             if mtype == "prompt":
@@ -223,77 +362,101 @@ async def relay(ws: WebSocket):
                     continue
                 print("RX:", user_text, flush=True)
 
-                # ====== Booking step 2: in "pick" mode, confirm which slot ======
-                if state["mode"] == "pick":
-                    choice = user_text.lower()
-                    picked = None
-                    if ("first" in choice) or ("1" in choice):
-                        picked = state["offered"][0]
-                    elif ("second" in choice) or ("2" in choice):
-                        picked = state["offered"][1]
-                    else:
-                        # crude match if the caller repeats part of the ISO
-                        for iso in state["offered"]:
-                            if iso[:16] in choice:
-                                picked = iso
-                                break
+                # ------- Our booking state machine (deterministic) -------
+                text = user_text
 
-                    if not picked:
-                        await send_text(ws, "Sorry—was that the first time or the second?")
+                # If we're waiting for a piece of info
+                if booking_state["need"] in ("date", "time", "confirm"):
+                    if booking_state["need"] == "date":
+                        d, _, _ = extract_datetime(text)
+                        if d:
+                            booking_state["hold_date"] = d
+                            # If we already have time, combine
+                            if booking_state["hold_time"]:
+                                booking_state["hold_dt"] = datetime.combine(d, booking_state["hold_time"], tzinfo=TZ)
+                                when_say = booking_state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                                booking_state["need"] = "confirm"
+                                await send_text(ws, f"Just to confirm, {when_say}?")
+                            else:
+                                booking_state["need"] = "time"
+                                await send_text(ws, "What time works? (e.g., 2 PM)")
+                        else:
+                            await send_text(ws, "Got it. What day did you have in mind? (e.g., Tuesday or September 15)")
                         continue
 
-                    # Try to book
-                    await send_text(ws, "Great—booking that now, one moment.")
-                    try:
-                        details = await cal_create_booking(
-                            start_iso=picked,
-                            name=state["caller_name"] or "Caller",
-                            phone=state["caller_phone"] or "unknown",
-                        )
-                        # Best-effort: confirm when; fall back to what we asked for
-                        when = (
-                            details.get("booking", {}).get("startTime")
-                            or details.get("start")
-                            or picked
-                        )
-                        await send_text(ws, f"All set. I’ve booked your appointment on {when}. Anything else?")
-                    except Exception as e:
-                        print("Cal.com booking error:", repr(e), flush=True)
-                        await send_text(ws, "I couldn’t finish the booking just now. Want me to try another time?")
-                    # Reset to chat
-                    state["mode"] = "chat"
-                    state["offered"] = []
-                    continue
-
-                # ====== Booking step 1: detect intent and fetch options ======
-                want_booking = bool(re.search(r"\\b(book|schedule|appointment|set up|meeting|consult)\\b", user_text, re.I))
-                if want_booking:
-                    # If Cal.com credentials are missing, keep the convo graceful
-                    if not (CAL_TOKEN and CAL_USERNAME and CAL_EVENT_SLUG):
-                        await send_text(ws, "I can help schedule, but my calendar isn’t connected yet. Anything else?")
+                    if booking_state["need"] == "time":
+                        _, t, _ = extract_datetime(text)
+                        if not t:
+                            await send_text(ws, "What time should I book? (e.g., 12 PM)")
+                            continue
+                        booking_state["hold_time"] = t
+                        # If we already have date, combine; otherwise ask for date
+                        if booking_state["hold_date"]:
+                            booking_state["hold_dt"] = datetime.combine(booking_state["hold_date"], t, tzinfo=TZ)
+                            when_say = booking_state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                            booking_state["need"] = "confirm"
+                            await send_text(ws, f"Just to confirm, {when_say}?")
+                        else:
+                            booking_state["need"] = "date"
+                            await send_text(ws, "Which day should I book? (e.g., Tuesday or 9/15)")
                         continue
 
-                    await send_text(ws, "Happy to help. Let me find the next available times.")
-                    try:
-                        now_local = datetime.now(ZoneInfo(CAL_TZ)).date()
-                        start = now_local.isoformat()
-                        end   = (now_local + timedelta(days=14)).isoformat()
-                        slots = await cal_get_slots(start, end)
-
-                        if len(slots) < 2:
-                            await send_text(ws, "I couldn’t find two open times right now. Would you like me to try again?")
+                    if booking_state["need"] == "confirm":
+                        if re.search(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|ok|okay)\b", text, re.I):
+                            # Save the appointment
+                            start_dt = booking_state["hold_dt"]
+                            rec = save_appointment(start_dt, caller_number)
+                            when_say = start_dt.strftime("%A %B %d at %I:%M %p %Z")
+                            # Optional Google Calendar push
+                            g_note = None
+                            if HAVE_GCAL and os.environ.get("GOOGLE_CALENDAR_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+                                g = await gcal_create_event(
+                                    "Foreclosure Relief Consultation",
+                                    start_dt,
+                                    start_dt + timedelta(minutes=30),
+                                    description=f"Caller: {caller_number or 'unknown'}",
+                                )
+                                if g.get("ok"):
+                                    g_note = g.get("htmlLink")
+                            # Reset state
+                            booking_state = {"need": None, "hold_date": None, "hold_time": None, "hold_dt": None}
+                            if g_note:
+                                await send_text(ws, f"All set — booked for {when_say}. I’ve added it to the calendar.")
+                            else:
+                                await send_text(ws, f"All set — you’re booked for {when_say}.")
+                            continue
+                        elif re.search(r"\b(no|nope|not|change|different|cancel)\b", text, re.I):
+                            booking_state = {"need": None, "hold_date": None, "hold_time": None, "hold_dt": None}
+                            await send_text(ws, "No problem. What day and time would you like instead?")
+                            continue
+                        else:
+                            await send_text(ws, "Please say yes or no to confirm.")
                             continue
 
-                        state["offered"] = slots[:2]
-                        await send_text(ws, f"I have two options. First: {slots[0]}. Second: {slots[1]}. Which works?")
-                        state["mode"] = "pick"
-
-                    except Exception as e:
-                        print("Error fetching slots:", repr(e), flush=True)
-                        await send_text(ws, "Sorry, I couldn’t check the calendar right now. Please try again later.")
+                # Fresh booking intent?
+                want_booking = bool(re.search(r"\b(book|appointment|schedule|set up|meeting|consult)\b", text, re.I))
+                if want_booking:
+                    d, t, dt = extract_datetime(text)
+                    if dt:
+                        when_say = dt.strftime("%A %B %d at %I:%M %p %Z")
+                        booking_state.update({"need": "confirm", "hold_date": d, "hold_time": t, "hold_dt": dt})
+                        await send_text(ws, f"Just to confirm, {when_say}?")
+                        continue
+                    # Partial info
+                    if d and not t:
+                        booking_state.update({"need": "time", "hold_date": d, "hold_time": None, "hold_dt": None})
+                        await send_text(ws, "What time should I book? (e.g., 12 PM)")
+                        continue
+                    if t and not d:
+                        booking_state.update({"need": "date", "hold_time": t, "hold_date": None, "hold_dt": None})
+                        await send_text(ws, "Which day should I book? (e.g., Tuesday or 9/15)")
+                        continue
+                    # No parse — ask both
+                    booking_state["need"] = "date"
+                    await send_text(ws, "What day works for you? (e.g., Tuesday or September 15)")
                     continue
 
-                # ---------- normal chat via OpenAI ----------
+                # ------- Otherwise, fallback to OpenAI small talk -------
                 try:
                     resp = client.responses.create(
                         model="gpt-4o-mini",
@@ -305,49 +468,9 @@ async def relay(ws: WebSocket):
                         max_output_tokens=180,
                         temperature=0.3,
                     )
-                    ai_text_raw = (resp.output_text or "").strip()
-                    ai_text = ai_text_raw
-
-                    # FIX: Always look for BOOK_JSON in the assistant text (previously only ran when empty).
-                    book = extract_booking(ai_text_raw)
-                    if book:
-                        # remove the BOOK_JSON line from what the caller hears
-                        ai_text = BOOK_RE.sub("", ai_text_raw).strip() or "Got it."
-
-                        try:
-                            req_local = dateparse.parse(book["start"])
-                            if req_local.tzinfo is None:
-                                req_local = req_local.replace(tzinfo=ZoneInfo(CAL_TZ))
-
-                            # check availability on that day
-                            day_start = req_local.date().isoformat()
-                            day_end   = (req_local.date() + timedelta(days=1)).isoformat()
-                            slots = await cal_get_slots(day_start, day_end)
-
-                            wanted_ok = any(s.startswith(req_local.isoformat()[:16]) for s in slots)
-                            if not wanted_ok and slots:
-                                ai_text = (ai_text + "\\n" if ai_text else "") + \
-                                          f"That time isn’t available. Next openings are {slots[0]} or {slots[1]}. Which works?"
-                            else:
-                                res = await cal_create_booking(
-                                    req_local.isoformat(),
-                                    name=book["name"],
-                                    phone=state.get("caller_phone"),
-                                )
-                                if res["ok"]:
-                                    when_say = req_local.strftime("%A %b %d at %I:%M %p")
-                                    ai_text = (ai_text + "\\n" if ai_text else "") + \
-                                              f"All set — you’re booked for {when_say}."
-                                else:
-                                    ai_text = (ai_text + "\\n" if ai_text else "") + \
-                                              f"Sorry, I couldn’t finalize that: {res['error']}."
-                        except Exception:
-                            ai_text = (ai_text + "\\n" if ai_text else "") + \
-                                      "I couldn’t parse that time. Could you say the date and time again, like ‘Tuesday at 2 PM’?"
-
+                    ai_text = (resp.output_text or "").strip()
                     if not ai_text:
                         ai_text = "Sorry, could you repeat that?"
-
                 except Exception as e:
                     print("OpenAI error:", repr(e), flush=True)
                     ai_text = "I’m having trouble right now. Please say that again."
@@ -372,3 +495,4 @@ async def relay(ws: WebSocket):
             # ignore other frame types
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
+        
