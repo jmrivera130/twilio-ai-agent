@@ -7,13 +7,111 @@ import json
 import asyncio
 import httpx
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
 from fastapi.responses import PlainTextResponse, JSONResponse
 from openai import OpenAI
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from dateutil import parser as dateparse
 # ---------- required env ----------
+# ---------- date/time parsing helpers (inline) ----------
+LA_TZ = ZoneInfo(CAL_TZ)
+UTC_TZ = ZoneInfo("UTC")
+
+WEEKDAYS = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6}
+MONTHS = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,"july":7,"august":8,"september":9,"october":10,"november":11,"december":12}
+
+def _next_weekday(now_dt, target):
+    d = (target - now_dt.weekday()) % 7
+    if d == 0:
+        d = 7
+    return (now_dt + timedelta(days=d)).date()
+
+def parse_date_phrase(text: str, now_dt):
+    s = text.lower()
+
+    m = re.search(r"\bin\s+(\d+)\s+day[s]?\b", s)
+    if m:
+        return (now_dt + timedelta(days=int(m.group(1)))).date()
+
+    if re.search(r"\btoday\b", s):
+        return now_dt.date()
+    if re.search(r"\btomorrow\b", s):
+        return (now_dt + timedelta(days=1)).date()
+
+    for name, idx in WEEKDAYS.items():
+        if re.search(rf"\b{name}\b", s):
+            return _next_weekday(now_dt, idx)
+
+    m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})\b", s)
+    if m:
+        mon_name = m.group(1)
+        mon = None
+        for full, num in MONTHS.items():
+            if full.startswith(mon_name[:3]):
+                mon = num
+                break
+        day = int(m.group(2))
+        year = now_dt.year
+        try:
+            d = date(year, mon, day)
+            if d < now_dt.date():
+                d = date(year+1, mon, day)
+            return d
+        except Exception:
+            pass
+
+    m = re.search(r"\b(\d{1,2})[/-](\d{1,2})\b", s)
+    if m:
+        mon, day = int(m.group(1)), int(m.group(2))
+        year = now_dt.year
+        try:
+            d = date(year, mon, day)
+            if d < now_dt.date():
+                d = date(year+1, mon, day)
+            return d
+        except Exception:
+            pass
+
+    m = re.search(r"\b(\d{4}-\d{2}-\d{2})\b", s)
+    if m:
+        try:
+            return datetime.fromisoformat(m.group(1)).date()
+        except Exception:
+            pass
+
+    return None
+
+def parse_time_phrase(text: str):
+    s = text.lower().replace(" ", "")
+    m = re.search(r"\b(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?)?\b", s)
+    if not m:
+        return None
+    hour = int(m.group(1))
+    minute = int(m.group(2) or 0)
+    ampm = (m.group(3) or "").replace(".", "")
+
+    if ampm == "pm" and hour != 12:
+        hour += 12
+    if ampm == "am" and hour == 12:
+        hour = 0
+    if not ampm and hour <= 7:
+        hour += 12
+
+    try:
+        return time(hour, minute)
+    except Exception:
+        return None
+
+def try_extract_dt_from_user(text: str):
+    now_dt = datetime.now(LA_TZ)
+    d = parse_date_phrase(text, now_dt)
+    t = parse_time_phrase(text)
+    if d and t:
+        local_dt = datetime.combine(d, t, tzinfo=LA_TZ)
+        return local_dt
+    return None
+
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]   # wss://<your-app>.onrender.com/relay
 
@@ -50,17 +148,10 @@ async def send_text(ws: WebSocket, text: str):
 # ---------- Cal.com v2 helpers ----------
 CAL_BASE = "https://api.cal.com/v2"
 
-CAL_TEAM_SLUG = os.environ.get("CALCOM_TEAM_SLUG")
-
-CAL_BOOKINGS_HEADERS = {
+CAL_HEADERS = {
     "Authorization": f"Bearer {CAL_TOKEN}" if CAL_TOKEN else "",
     "cal-api-version": "2024-08-13",
     "Content-Type": "application/json",
-}
-
-CAL_SLOTS_HEADERS = {
-    "Authorization": f"Bearer {CAL_TOKEN}" if CAL_TOKEN else "",
-    "cal-api-version": "2024-09-04",
 }
 
 async def cal_get_slots(start_date: str, end_date: str) -> list[str]:
@@ -79,7 +170,7 @@ async def cal_get_slots(start_date: str, end_date: str) -> list[str]:
         "timeZone": CAL_TZ,
     }
     async with httpx.AsyncClient(timeout=15) as x:
-        r = await x.get(url, headers=CAL_SLOTS_HEADERS, params=params)
+        r = await x.get(url, headers=CAL_HEADERS, params=params)
     try:
         j = r.json()
     except Exception:
@@ -93,50 +184,45 @@ async def cal_get_slots(start_date: str, end_date: str) -> list[str]:
         return out
     return []
 
-
-async def cal_create_booking(start_iso: str, name: str, phone: str | None, duration_min: int = 30, email: str | None = None):
+async def cal_create_booking(start_iso: str, name: str, phone: str | None, duration_min: int = 30):
     """
-    Create booking via Cal.com API v2.
-    - start_iso: local (CAL_TZ) or tz-aware string; converted to UTC Z per docs.
-    - Uses eventTypeSlug + (username or teamSlug).
+    POST /v2/bookings to actually create the meeting.
+    Returns dict: {"ok": bool, "id": "...", "error": "..."}
     """
-    if not (CAL_TOKEN and CAL_EVENT_SLUG and (CAL_USERNAME or CAL_TEAM_SLUG)):
+    if not (CAL_TOKEN and CAL_USERNAME and CAL_EVENT_SLUG):
         return {"ok": False, "error": "Missing Cal.com env vars"}
-
-    # Normalize to UTC Z
+    # normalize start in org TZ and compute end
     start_dt = dateparse.parse(start_iso)
     if start_dt.tzinfo is None:
         start_dt = start_dt.replace(tzinfo=ZoneInfo(CAL_TZ))
-    start_utc = start_dt.astimezone(ZoneInfo("UTC")).isoformat().replace("+00:00", "Z")
-
-    attendee = {"name": name or "Caller", "timeZone": CAL_TZ}
-    attendee["email"] = email or "caller@example.com"
-    if phone:
-        attendee["phoneNumber"] = phone
+    end_dt = start_dt + timedelta(minutes=duration_min)
 
     payload = {
-        "start": start_utc,
-        "attendee": attendee,
         "eventTypeSlug": CAL_EVENT_SLUG,
-        "lengthInMinutes": int(duration_min),
+        "username": CAL_USERNAME,
+        "start": start_dt.isoformat(),
+        "end": end_dt.isoformat(),
+        "timeZone": CAL_TZ,
+        "durationInMinutes": duration_min,
+        "attendee": {
+            "name": name,
+            # email is optional if your event type doesn’t require it
+            **({"phoneNumber": phone} if phone else {}),
+        },
     }
-    if CAL_TEAM_SLUG:
-        payload["teamSlug"] = CAL_TEAM_SLUG
-    else:
-        payload["username"] = CAL_USERNAME
-
     url = "https://api.cal.com/v2/bookings"
     async with httpx.AsyncClient(timeout=20) as x:
-        r = await x.post(url, headers=CAL_BOOKINGS_HEADERS, json=payload)
+        r = await x.post(url, headers=CAL_HEADERS, json=payload)
     try:
         j = r.json()
     except Exception:
         return {"ok": False, "error": f"HTTP {r.status_code}"}
-    if r.status_code in (200, 201) and j.get("status") == "success":
+    if r.status_code == 200 and j.get("status") == "success":
         bid = (j.get("data") or {}).get("id") or (j.get("data") or {}).get("uid")
-        return {"ok": True, "id": str(bid), "data": j.get("data")}
-    return {"ok": False, "error": j.get("error", {}).get("message") or j.get("message") or str(j)}
-BOOK_RE = re.compile(r'BOOK_JSON:\s*(\{.*\})\s*$', re.IGNORECASE | re.DOTALL)
+        return {"ok": True, "id": str(bid)}
+    return {"ok": False, "error": j.get("message") or str(j) }
+
+BOOK_RE = re.compile(r"BOOK_JSON:\s*(\{[^}]*\})", re.IGNORECASE | re.DOTALL)\s*$', re.IGNORECASE | re.DOTALL)
 
 def extract_booking(json_line: str) -> dict | None:
     m = BOOK_RE.search(json_line)
@@ -175,18 +261,6 @@ async def voice(_: Request):
 @app.get("/")
 async def index():
     return PlainTextResponse("OK")
-
-@app.head("/")
-async def index_head():
-    return Response(status_code=200)
-
-@app.get("/healthz")
-async def healthz():
-    return JSONResponse({"ok": True})
-
-@app.get("/favicon.ico")
-async def favicon():
-    return Response(status_code=204)
 
 @app.get("/health")
 async def health():
@@ -231,6 +305,24 @@ async def relay(ws: WebSocket):
                 if not user_text:
                     continue
                 print("RX:", user_text, flush=True)
+                # --- server-side quick booking if the user says a date+time ---
+                dt_candidate = try_extract_dt_from_user(user_text)
+                if dt_candidate:
+                    when_say = dt_candidate.strftime("%A %B %d at %I:%M %p")
+                    await send_text(ws, f"Got it. Booking {when_say}. One moment.")
+                    try:
+                        details = await cal_create_booking(
+                            start_iso=dt_candidate.isoformat(),
+                            name=state.get("caller_name") or "Caller",
+                            phone=state.get("caller_phone"),
+                        )
+                        if details.get("ok"):
+                            await send_text(ws, f"All set — you’re booked for {when_say}.")
+                        else:
+                            await send_text(ws, f"I couldn’t finish the booking: {details.get('error')}.")
+                    except Exception as e:
+                        await send_text(ws, "I had trouble booking just now. Want me to try a different time?")
+                    continue
 
                 # ====== Booking step 2: in "pick" mode, confirm which slot ======
                 if state["mode"] == "pick":
@@ -319,6 +411,10 @@ async def relay(ws: WebSocket):
                         ai_text = "Sorry, could you repeat that?"
                         book = extract_booking(ai_text)
                         if book:
+                            # ignore placeholder JSON like YYYY-MM-DD
+                        if "YYYY" in book.get("start",""):
+                            book = None
+                        else:
                             # remove the BOOK_JSON line from what the caller hears
                             ai_text = BOOK_RE.sub("", ai_text).strip()
                             try:
