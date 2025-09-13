@@ -1,6 +1,7 @@
 # app.py — FastAPI + Twilio Conversation Relay + OpenAI (fallback)
 # Local bookings (JSONL) + CSV reports + ICS downloads + optional Google Calendar
 # No Cal.com. Timezone-aware and low-latency.
+# Adds: name/address capture, unified CSV, and Do-Not-Contact (opt-out) flow.
 
 import os
 import re
@@ -35,7 +36,8 @@ app = FastAPI()
 
 SYSTEM_PROMPT = (
     "You are Chloe from Foreclosure Relief Group. Be warm, concise, and clear. "
-    "Prefer 1–3 short sentences. Avoid filler. Offer more detail only if asked."
+    "Prefer 1–3 short sentences. Avoid filler. Offer more detail only if asked. "
+    "If the caller asks for help, offer to schedule a consultation."
 )
 
 # ---------- utils ----------
@@ -70,35 +72,79 @@ def make_ics(uid: str, start_dt: datetime, end_dt: datetime, summary: str, descr
     ]
     return "\r\n".join(lines)
 
-def save_appointment(start_dt: datetime, caller_number: str | None, note: str = "Consultation", duration_min: int = 30):
+def _write_jsonl_for_day(day: date, rec: dict):
+    p = _day_path(day)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+def save_booking(start_dt: datetime, caller_number: str | None,
+                 name: str | None, address: str | None,
+                 note: str = "Consultation", duration_min: int = 30,
+                 gcal_link: str | None = None):
     end_dt = start_dt + timedelta(minutes=duration_min)
     rec = {
+        "type": "booking",
         "id": uuid.uuid4().hex[:12],
+        "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
         "caller": caller_number,
+        "name": (name or "").strip(),
+        "address": (address or "").strip(),
         "note": note,
-        "created_at": datetime.now(ZoneInfo("UTC")).isoformat()
+        "gcal_link": gcal_link or ""
     }
-    p = _day_path(start_dt.date())
-    with p.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    # Store under the APPOINTMENT DATE so /reports/YYYY-MM-DD shows that day’s bookings
+    _write_jsonl_for_day(start_dt.date(), rec)
     # also write ICS for download
-    ics_text = make_ics(rec["id"], start_dt, end_dt, "Foreclosure Relief Consultation", f"Caller: {caller_number or 'unknown'}")
+    ics_text = make_ics(rec["id"], start_dt, end_dt,
+                        "Foreclosure Relief Consultation",
+                        f"Caller: {caller_number or 'unknown'}; Name: {rec['name']}; Address: {rec['address']}")
     (ICS_DIR / f"{rec['id']}.ics").write_text(ics_text, encoding="utf-8")
     return rec
 
+def save_optout(caller_number: str | None, name: str | None, address: str | None, note: str = "DNC request"):
+    now_local = datetime.now(TZ)
+    rec = {
+        "type": "optout",
+        "id": uuid.uuid4().hex[:12],
+        "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "start": "",
+        "end": "",
+        "caller": caller_number,
+        "name": (name or "").strip(),
+        "address": (address or "").strip(),
+        "note": note,
+        "gcal_link": ""
+    }
+    # Store under TODAY so today's report contains DNCs from today
+    _write_jsonl_for_day(now_local.date(), rec)
+    return rec
+
 def render_report_csv(day: date) -> str:
+    # Unified header for both booking & optout records
+    header = ["id","type","created_at","start","end","caller","name","address","note","gcal_link"]
     p = _day_path(day)
     rows = []
     if p.exists():
         for line in p.read_text(encoding="utf-8").splitlines():
             try:
                 j = json.loads(line)
-                rows.append([j.get("id",""), j.get("start",""), j.get("end",""), j.get("caller","") or "", j.get("note","") or ""])
+                rows.append([
+                    j.get("id",""),
+                    j.get("type",""),
+                    j.get("created_at",""),
+                    j.get("start",""),
+                    j.get("end",""),
+                    j.get("caller","") or "",
+                    j.get("name","") or "",
+                    j.get("address","") or "",
+                    j.get("note","") or "",
+                    j.get("gcal_link","") or "",
+                ])
             except Exception:
                 continue
-    out = ["id,start,end,caller,note"]
+    out = [",".join(header)]
     for r in rows:
         safe = ['"{}"'.format(str(x).replace('"','""')) for x in r]
         out.append(",".join(safe))
@@ -182,7 +228,7 @@ def parse_date_phrase(text: str, now_dt: datetime) -> date | None:
             return _next_weekday(now_dt, idx)
 
     # month name + day (e.g., September 15 / Sep 15)
-    m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})\b", s)
+    m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?)\s+(\d{1,2})\b", s)
     if m:
         month_name = m.group(1)
         mon = None
@@ -327,6 +373,8 @@ async def report_day(day: str):
         headers={"Content-Disposition": f'attachment; filename="{fname}"'})
 
 # ---------- WebSocket: Twilio connects here ----------
+OPT_OUT_RE = re.compile(r"\b(opt\s*out|do\s*not\s*contact|do\s*not\s*call|don't\s*call|do not call|stop|unsubscribe|remove me|take me off)\b", re.I)
+
 @app.websocket("/relay")
 async def relay(ws: WebSocket):
     await ws.accept()
@@ -335,13 +383,16 @@ async def relay(ws: WebSocket):
     # tiny rolling history for coherence (kept short for latency)
     history: list[dict] = []
 
-    # caller + booking state
+    # caller + unified state
     caller_number: str | None = None
-    booking_state = {
-        "need": None,          # None | "date" | "time" | "confirm"
+    state = {
+        "mode": None,          # None | "booking" | "optout"
+        "need": None,          # None | "date" | "time" | "name" | "address" | "confirm"
         "hold_date": None,     # date obj
         "hold_time": None,     # time obj
-        "hold_dt": None        # datetime obj
+        "hold_dt": None,       # datetime obj
+        "hold_name": None,     # str
+        "hold_address": None   # str
     }
 
     try:
@@ -351,7 +402,6 @@ async def relay(ws: WebSocket):
 
             # Twilio sends this once at call start
             if mtype == "setup":
-                # Capture caller number if available
                 caller_number = (msg.get("from") or "").strip() or None
                 continue
 
@@ -361,127 +411,213 @@ async def relay(ws: WebSocket):
                 if not user_text:
                     continue
                 print("RX:", user_text, flush=True)
-
-                # ------- Our booking state machine (deterministic) -------
                 text = user_text
 
-                # If we're waiting for a piece of info
-                if booking_state["need"] in ("date", "time", "confirm"):
-                    if booking_state["need"] == "date":
-                        d, _, _ = extract_datetime(text)
-                        if d:
-                            booking_state["hold_date"] = d
-                            # If we already have time, combine
-                            if booking_state["hold_time"]:
-                                booking_state["hold_dt"] = datetime.combine(d, booking_state["hold_time"], tzinfo=TZ)
-                                when_say = booking_state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
-                                booking_state["need"] = "confirm"
-                                await send_text(ws, f"Just to confirm, {when_say}?")
-                            else:
-                                booking_state["need"] = "time"
-                                await send_text(ws, "What time works? (e.g., 2 PM)")
-                        else:
-                            await send_text(ws, "Got it. What day did you have in mind? (e.g., Tuesday or September 15)")
+                # -------- global: detect Opt-Out at any time --------
+                if OPT_OUT_RE.search(text):
+                    state.update({"mode": "optout"})
+                    if not state["hold_name"]:
+                        state["need"] = "name"
+                        await send_text(ws, "Understood. I’ll mark you as do-not-contact. What’s your full name?")
                         continue
+                    if not state["hold_address"]:
+                        state["need"] = "address"
+                        await send_text(ws, "Thanks. What’s the property address to stop contacting?")
+                        continue
+                    state["need"] = "confirm"
+                    await send_text(ws, f"Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {caller_number}. Is that correct?")
+                    continue
 
-                    if booking_state["need"] == "time":
-                        _, t, _ = extract_datetime(text)
-                        if not t:
-                            await send_text(ws, "What time should I book? (e.g., 12 PM)")
+                # -------- handle ongoing optout flow --------
+                if state["mode"] == "optout":
+                    if state["need"] == "name":
+                        nm = text.strip()
+                        if len(nm) < 2:
+                            await send_text(ws, "Could you please repeat your full name?")
                             continue
-                        booking_state["hold_time"] = t
-                        # If we already have date, combine; otherwise ask for date
-                        if booking_state["hold_date"]:
-                            booking_state["hold_dt"] = datetime.combine(booking_state["hold_date"], t, tzinfo=TZ)
-                            when_say = booking_state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
-                            booking_state["need"] = "confirm"
-                            await send_text(ws, f"Just to confirm, {when_say}?")
-                        else:
-                            booking_state["need"] = "date"
-                            await send_text(ws, "Which day should I book? (e.g., Tuesday or 9/15)")
+                        state["hold_name"] = nm
+                        state["need"] = "address"
+                        await send_text(ws, "Thanks. What’s the property address?")
                         continue
 
-                    if booking_state["need"] == "confirm":
-                        if re.search(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|ok|okay)\b", text, re.I):
-                            # Save the appointment
-                            start_dt = booking_state["hold_dt"]
-                            rec = save_appointment(start_dt, caller_number)
-                            when_say = start_dt.strftime("%A %B %d at %I:%M %p %Z")
-                            # Optional Google Calendar push
-                            g_note = None
-                            if HAVE_GCAL and os.environ.get("GOOGLE_CALENDAR_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
-                                g = await gcal_create_event(
-                                    "Foreclosure Relief Consultation",
-                                    start_dt,
-                                    start_dt + timedelta(minutes=30),
-                                    description=f"Caller: {caller_number or 'unknown'}",
-                                )
-                                if g.get("ok"):
-                                    g_note = g.get("htmlLink")
-                            # Reset state
-                            booking_state = {"need": None, "hold_date": None, "hold_time": None, "hold_dt": None}
-                            if g_note:
-                                await send_text(ws, f"All set — booked for {when_say}. I’ve added it to the calendar.")
-                            else:
-                                await send_text(ws, f"All set — you’re booked for {when_say}.")
+                    if state["need"] == "address":
+                        addr = text.strip()
+                        if len(addr) < 4:
+                            await send_text(ws, "Could you repeat the property address?")
+                            continue
+                        state["hold_address"] = addr
+                        state["need"] = "confirm"
+                        await send_text(ws, f"Confirm do-not-contact for {state['hold_name']} at {state['hold_address']}, phone {caller_number}. Is that correct?")
+                        continue
+
+                    if state["need"] == "confirm":
+                        if re.search(r"\b(yes|yeah|yep|correct|confirmed|that’s right|that is right|ok|okay)\b", text, re.I):
+                            rec = save_optout(caller_number, state["hold_name"], state["hold_address"])
+                            state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None}
+                            await send_text(ws, "All set — I’ve marked you as do-not-contact. Take care.")
                             continue
                         elif re.search(r"\b(no|nope|not|change|different|cancel)\b", text, re.I):
-                            booking_state = {"need": None, "hold_date": None, "hold_time": None, "hold_dt": None}
-                            await send_text(ws, "No problem. What day and time would you like instead?")
+                            state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None}
+                            await send_text(ws, "Okay. How else can I help?")
                             continue
                         else:
                             await send_text(ws, "Please say yes or no to confirm.")
                             continue
 
-                # Fresh booking intent?
+                # -------- booking: detect intent --------
                 want_booking = bool(re.search(r"\b(book|appointment|schedule|set up|meeting|consult)\b", text, re.I))
-                if want_booking:
+                if state["mode"] is None and want_booking:
+                    state["mode"] = "booking"
+                    # fall through to normal booking flow
+
+                # -------- booking flow --------
+                if state["mode"] == "booking":
+                    # Fill what we can from this utterance
                     d, t, dt = extract_datetime(text)
-                    if dt:
-                        when_say = dt.strftime("%A %B %d at %I:%M %p %Z")
-                        booking_state.update({"need": "confirm", "hold_date": d, "hold_time": t, "hold_dt": dt})
-                        await send_text(ws, f"Just to confirm, {when_say}?")
+                    if d:
+                        state["hold_date"] = d
+                    if t:
+                        state["hold_time"] = t
+                    if state["hold_date"] and state["hold_time"]:
+                        state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+
+                    # ask in order: date -> time -> name -> address -> confirm
+                    if not state["hold_date"]:
+                        state["need"] = "date"
+                        await send_text(ws, "What day works for you? (e.g., Tuesday or September 15)")
                         continue
-                    # Partial info
-                    if d and not t:
-                        booking_state.update({"need": "time", "hold_date": d, "hold_time": None, "hold_dt": None})
+                    if not state["hold_time"]:
+                        state["need"] = "time"
                         await send_text(ws, "What time should I book? (e.g., 12 PM)")
                         continue
-                    if t and not d:
-                        booking_state.update({"need": "date", "hold_time": t, "hold_date": None, "hold_dt": None})
-                        await send_text(ws, "Which day should I book? (e.g., Tuesday or 9/15)")
+                    if not state["hold_name"]:
+                        state["need"] = "name"
+                        when_say = state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                        await send_text(ws, f"Great — I have {when_say}. What’s your full name?")
                         continue
-                    # No parse — ask both
-                    booking_state["need"] = "date"
-                    await send_text(ws, "What day works for you? (e.g., Tuesday or September 15)")
+                    if not state["hold_address"]:
+                        state["need"] = "address"
+                        await send_text(ws, "Thanks. What’s the property address?")
+                        continue
+
+                    # confirm all details
+                    state["need"] = "confirm"
+                    when_say = state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                    await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
                     continue
 
-                # ------- Otherwise, fallback to OpenAI small talk -------
-                try:
-                    resp = client.responses.create(
-                        model="gpt-4o-mini",
-                        input=[
-                            {"role": "system", "content": SYSTEM_PROMPT},
-                            *history[-6:],  # last 3 turns (user+assistant)
-                            {"role": "user", "content": user_text},
-                        ],
-                        max_output_tokens=180,
-                        temperature=0.3,
-                    )
-                    ai_text = (resp.output_text or "").strip()
-                    if not ai_text:
-                        ai_text = "Sorry, could you repeat that?"
-                except Exception as e:
-                    print("OpenAI error:", repr(e), flush=True)
-                    ai_text = "I’m having trouble right now. Please say that again."
+                # -------- respond normally if not in a flow --------
+                if not want_booking and state["mode"] is None:
+                    try:
+                        resp = client.responses.create(
+                            model="gpt-4o-mini",
+                            input=[
+                                {"role": "system", "content": SYSTEM_PROMPT},
+                                *history[-6:],  # last 3 turns (user+assistant)
+                                {"role": "user", "content": user_text},
+                            ],
+                            max_output_tokens=180,
+                            temperature=0.3,
+                        )
+                        ai_text = (resp.output_text or "").strip()
+                        if not ai_text:
+                            ai_text = "Sorry, could you repeat that?"
+                    except Exception as e:
+                        print("OpenAI error:", repr(e), flush=True)
+                        ai_text = "I’m having trouble right now. Please say that again."
 
-                print("TX:", ai_text, flush=True)
+                    print("TX:", ai_text, flush=True)
+                    history.append({"role": "user", "content": user_text})
+                    history.append({"role": "assistant", "content": ai_text})
+                    await send_text(ws, ai_text)
+                    continue
 
-                # keep short context
-                history.append({"role": "user", "content": user_text})
-                history.append({"role": "assistant", "content": ai_text})
+                # -------- booking confirmation handler --------
+                if state["mode"] == "booking" and state["need"] == "confirm":
+                    if re.search(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|ok|okay)\b", text, re.I):
+                        start_dt = state["hold_dt"]
+                        g_link = None
+                        # Optional Google Calendar push
+                        if HAVE_GCAL and os.environ.get("GOOGLE_CALENDAR_ID") and os.environ.get("GOOGLE_SERVICE_ACCOUNT_JSON"):
+                            g = await gcal_create_event(
+                                "Foreclosure Relief Consultation",
+                                start_dt,
+                                start_dt + timedelta(minutes=30),
+                                description=f"Caller: {caller_number or 'unknown'}; Name: {state['hold_name']}; Address: {state['hold_address']}",
+                            )
+                            if g.get("ok"):
+                                g_link = g.get("htmlLink")
+                        rec = save_booking(start_dt, caller_number, state["hold_name"], state["hold_address"], gcal_link=g_link)
+                        when_say = start_dt.strftime("%A %B %d at %I:%M %p %Z")
+                        state = {"mode": None, "need": None, "hold_date": None, "hold_time": None, "hold_dt": None, "hold_name": None, "hold_address": None}
+                        if g_link:
+                            await send_text(ws, f"All set — booked for {when_say}. I’ve added it to the calendar.")
+                        else:
+                            await send_text(ws, f"All set — you’re booked for {when_say}.")
+                        continue
+                    elif re.search(r"\b(no|nope|not|change|different|cancel)\b", text, re.I):
+                        state["need"] = "date"
+                        await send_text(ws, "No problem. What day and time would you like instead?")
+                        continue
+                    else:
+                        await send_text(ws, "Please say yes or no to confirm.")
+                        continue
 
-                await send_text(ws, ai_text)
+                # -------- filling fields if we’re mid-flow but not at confirm --------
+                if state["mode"] == "booking":
+                    if state["need"] == "date":
+                        d, _, _ = extract_datetime(text)
+                        if d:
+                            state["hold_date"] = d
+                            if state["hold_time"]:
+                                state["hold_dt"] = datetime.combine(d, state["hold_time"], tzinfo=TZ)
+                        else:
+                            await send_text(ws, "Got it. What day did you have in mind? (e.g., Tuesday or September 15)")
+                            continue
+                    elif state["need"] == "time":
+                        _, t, _ = extract_datetime(text)
+                        if t:
+                            state["hold_time"] = t
+                            if state["hold_date"]:
+                                state["hold_dt"] = datetime.combine(state["hold_date"], t, tzinfo=TZ)
+                        else:
+                            await send_text(ws, "What time should I book? (e.g., 12 PM)")
+                            continue
+                    elif state["need"] == "name":
+                        nm = text.strip()
+                        if len(nm) < 2:
+                            await send_text(ws, "Could you please repeat your full name?")
+                            continue
+                        state["hold_name"] = nm
+                    elif state["need"] == "address":
+                        addr = text.strip()
+                        if len(addr) < 4:
+                            await send_text(ws, "Could you repeat the property address?")
+                            continue
+                        state["hold_address"] = addr
+
+                    # after filling, proceed down the chain again
+                    if not state["hold_date"]:
+                        await send_text(ws, "What day works for you? (e.g., Tuesday or September 15)")
+                        continue
+                    if not state["hold_time"]:
+                        await send_text(ws, "What time should I book? (e.g., 12 PM)")
+                        continue
+                    if not state["hold_name"]:
+                        when_say = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ).strftime("%A %B %d at %I:%M %p %Z")
+                        await send_text(ws, f"Great — I have {when_say}. What’s your full name?")
+                        continue
+                    if not state["hold_address"]:
+                        await send_text(ws, "Thanks. What’s the property address?")
+                        continue
+                    state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+                    state["need"] = "confirm"
+                    when_say = state["hold_dt"].strftime("%A %B %d at %I:%M %p %Z")
+                    await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
+                    continue
+
+                # fallback safety
+                await send_text(ws, "Sorry, could you repeat that?")
                 continue
 
             if mtype == "interrupt":
@@ -495,4 +631,3 @@ async def relay(ws: WebSocket):
             # ignore other frame types
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
-        
