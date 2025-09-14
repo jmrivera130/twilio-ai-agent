@@ -86,12 +86,14 @@ def save_booking(start_dt: datetime, caller_number: str | None,
         "type": "booking",
         "id": uuid.uuid4().hex[:12],
         "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        # store appointment start/end in local timezone ISO8601
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
         "caller": caller_number,
         "name": (name or "").strip(),
         "address": (address or "").strip(),
         "note": note,
+        # Only populate if Google Calendar is enabled; otherwise leave empty
         "calendar_link": ""
     }
     # Store under the APPOINTMENT DATE so /reports/YYYY-MM-DD shows that day’s bookings
@@ -101,9 +103,20 @@ def save_booking(start_dt: datetime, caller_number: str | None,
                         "Foreclosure Relief Consultation",
                         f"Caller: {caller_number or 'unknown'}; Name: {rec['name']}; Address: {rec['address']}")
     (ICS_DIR / f"{rec['id']}.ics").write_text(ics_text, encoding="utf-8")
-    # Set calendar link preference (Google link else ICS download)
-    rec["calendar_link"] = gcal_link or f"/ics/{rec['id']}.ics"
+    # Set calendar link only when Google Calendar is enabled; do not fallback to ICS in CSV field
+    if gcal_link:
+        rec["calendar_link"] = gcal_link
+    # Write under the appointment date
     _write_jsonl_for_day(start_dt.date(), rec)
+    # Mirror a copy into TODAY's file so today's CSV shows bookings immediately
+    try:
+        mirror = dict(rec)
+        # mark this as a mirror row for clarity in today's CSV
+        note_str = (mirror.get("note") or "").strip()
+        mirror["note"] = "mirror=true" if not note_str else f"{note_str}; mirror=true"
+        _write_jsonl_for_day(datetime.now(TZ).date(), mirror)
+    except Exception:
+        pass
     return rec
 
 def save_optout(caller_number: str | None, name: str | None, address: str | None, note: str = "DNC request"):
@@ -125,8 +138,19 @@ def save_optout(caller_number: str | None, name: str | None, address: str | None
     return rec
 
 def render_report_csv(day: date) -> str:
-    # Unified header for both booking & optout records
-    header = ["id","type","created_at","start","end","caller","name","address","note","calendar_link"]
+    # Standardized header and naming
+    header = [
+        "id",
+        "record_type",
+        "created_at",
+        "caller",
+        "name",
+        "address",
+        "appointment_start",
+        "appointment_end",
+        "note",
+        "calendar_link",
+    ]
     p = _day_path(day)
     rows = []
     if p.exists():
@@ -134,16 +158,18 @@ def render_report_csv(day: date) -> str:
             try:
                 j = json.loads(line)
                 rows.append([
-                    j.get("id",""),
-                    j.get("type",""),
-                    j.get("created_at",""),
-                    j.get("start",""),
-                    j.get("end",""),
-                    j.get("caller","") or "",
-                    j.get("name","") or "",
-                    j.get("address","") or "",
-                    j.get("note","") or "",
-                    j.get("calendar_link","") or "",
+                    j.get("id", ""),
+                    # map JSONL 'type' to CSV 'record_type'
+                    j.get("type", ""),
+                    j.get("created_at", ""),
+                    j.get("caller", "") or "",
+                    j.get("name", "") or "",
+                    j.get("address", "") or "",
+                    # rename start/end -> appointment_start/appointment_end
+                    j.get("start", ""),
+                    j.get("end", ""),
+                    j.get("note", "") or "",
+                    j.get("calendar_link", "") or "",
                 ])
             except Exception:
                 continue
@@ -323,12 +349,19 @@ def maybe_extract_address(text: str) -> str | None:
     m = re.search(r"\b(?:address|property address|the address)\s*(?:is|:)?\s*(.+)", text, re.I)
     if m:
         addr = m.group(1).strip()
-        if len(addr) >= 4:
+        # prefer street-like values containing a street number and name
+        if re.search(r"\b\d{1,6}\s+[A-Za-z0-9][A-Za-z0-9\s\.\-']{3,}\b", addr):
             return addr
     m2 = re.search(r"\b\d{2,6}\s+[A-Za-z0-9][A-Za-z0-9\s\.\-']{3,}\b", text)
     if m2:
         return m2.group(0).strip()
     return None
+
+def is_full_street_address(text: str) -> bool:
+    """Return True if text looks like a full street address (number + street)."""
+    if not text:
+        return False
+    return bool(re.search(r"\b\d{1,6}\s+[A-Za-z0-9][A-Za-z0-9\s\.\-']{3,}\b", text.strip()))
 
 def maybe_extract_phone(text: str) -> str | None:
     # Pull out a plausible phone number from free text
@@ -501,7 +534,7 @@ async def relay(ws: WebSocket):
                         continue
                     if not state["hold_address"]:
                         state["need"] = "address"
-                        await send_text(ws, "Thanks. What’s the property address to stop contacting?")
+                        await send_text(ws, "Could you say the full property address, including the street and number?")
                         continue
                     # ensure we have a phone number; ask if caller ID missing
                     if not caller_number and not state["hold_phone"]:
@@ -522,13 +555,13 @@ async def relay(ws: WebSocket):
                             continue
                         state["hold_name"] = nm
                         state["need"] = "address"
-                        await send_text(ws, "Thanks. What’s the property address?")
+                        await send_text(ws, "Could you say the full property address, including the street and number?")
                         continue
 
                     if state["need"] == "address":
                         addr = text.strip()
-                        if len(addr) < 4:
-                            await send_text(ws, "Could you repeat the property address?")
+                        if not is_full_street_address(addr):
+                            await send_text(ws, "Could you say the full property address, including the street and number?")
                             continue
                         state["hold_address"] = addr
                         # if we don't have a phone number, ask for it
@@ -621,7 +654,7 @@ async def relay(ws: WebSocket):
                         continue
                     if not state["hold_address"]:
                         state["need"] = "address"
-                        await send_text(ws, "Thanks. What’s the property address?")
+                        await send_text(ws, "Could you say the full property address, including the street and number?")
                         continue
 
                     # ensure we have a phone number
@@ -633,7 +666,7 @@ async def relay(ws: WebSocket):
                         # confirm all details
                         state["need"] = "confirm"
                         when_say = when_phrase(state["hold_dt"])
-                        await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
+                        await send_text(ws, f"To confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
                         continue
 
                 # -------- respond normally if not in a flow --------
@@ -722,8 +755,8 @@ async def relay(ws: WebSocket):
                         state["hold_name"] = nm
                     elif state["need"] == "address":
                         addr = text.strip()
-                        if len(addr) < 4:
-                            await send_text(ws, "Could you repeat the property address?")
+                        if not is_full_street_address(addr):
+                            await send_text(ws, "Could you say the full property address, including the street and number?")
                             continue
                         state["hold_address"] = addr
                     elif state["need"] == "phone":
@@ -745,7 +778,7 @@ async def relay(ws: WebSocket):
                         await send_text(ws, f"Great — I have {when_say}. What’s your full name?")
                         continue
                     if not state["hold_address"]:
-                        await send_text(ws, "Thanks. What’s the property address?")
+                        await send_text(ws, "Could you say the full property address, including the street and number?")
                         continue
                     state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
                     if not caller_number and not state["hold_phone"]:
@@ -754,7 +787,7 @@ async def relay(ws: WebSocket):
                         continue
                     state["need"] = "confirm"
                     when_say = when_phrase(state["hold_dt"])
-                    await send_text(ws, f"Just to confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
+                    await send_text(ws, f"To confirm: {state['hold_name']} at {state['hold_address']} on {when_say}. Is that correct?")
                     continue
 
                 # fallback safety
