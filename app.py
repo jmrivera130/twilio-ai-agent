@@ -26,7 +26,14 @@ TZ = ZoneInfo(BUSINESS_TZ)
 
 # Voice normalization for Twilio + Amazon Polly
 TTS_VOICE_ENV = os.environ.get("TTS_VOICE", "Polly.Joanna")
-VOICE_OUT = TTS_VOICE_ENV if TTS_VOICE_ENV.startswith("Polly.") else f"Polly.{TTS_VOICE_ENV}"
+# Get just the base name (e.g., "Joanna" from "Polly.Joanna" or "Joanna-Neural")
+_base = TTS_VOICE_ENV.split(".")[-1]
+# Strip "-Neural" (case-insensitive) if present
+_base = re.sub(r'(?i)-?neural$', '', _base)
+
+# Final voice Twilio accepts
+VOICE_OUT = f"Polly.{_base}"
+
 # Storage dirs
 BOOK_DIR   = Path(os.environ.get("BOOK_DIR", "/tmp/appointments"))
 REPORT_DIR = Path(os.environ.get("REPORT_DIR", "/tmp/reports"))
