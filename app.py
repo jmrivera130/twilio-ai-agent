@@ -435,6 +435,7 @@ async def relay(ws: WebSocket):
         "hold_phone": None,
         "offered_booking": False,
         "capture_next": None,
+        "name_buffer": [],
     }
 
     try:
@@ -464,6 +465,25 @@ async def relay(ws: WebSocket):
                             continue
                         await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])))
                         continue
+                    if state["capture_next"] == "name_tail":
+                        toks = _name_tokens(user_text)
+                        if len(toks) >= 1 and state.get("name_buffer"):
+                            state["hold_name"] = f"{state["name_buffer"][0]} {toks[0]}"
+                            state["name_buffer"] = []
+                            state["capture_next"] = None
+                            state["need"] = "address"
+                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                            continue
+                        if len(toks) >= 2:
+                            state["hold_name"] = f"{toks[0]} {toks[1]}"
+                            state["name_buffer"] = []
+                            state["capture_next"] = None
+                            state["need"] = "address"
+                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                            continue
+                        await send_text(ws, "Please say your last name.")
+                        continue
+
                     if state["capture_next"] == "address":
                         addr = (maybe_extract_address(user_text) or user_text).strip()
                         if is_full_street_address(addr):
@@ -609,7 +629,8 @@ async def relay(ws: WebSocket):
                     if not state["hold_time"]:
                         state["need"] = "time"; await send_text(ws, MSG["ask_time"]); continue
                     if not state["hold_name"]:
-                        state["need"] = "name"; state["capture_next"] = "name"; when_say = when_phrase(state["hold_dt"], lang); await send_text(ws, MSG["ask_name"].format(when=when_say)); continue
+                        state["need"] = "name"; state["capture_next"] = "name"; state["name_buffer"] = []
+                    when_say = when_phrase(state["hold_dt"], lang); await send_text(ws, MSG["ask_name"].format(when=when_say)); continue
                     if not state["hold_address"]:
                         state["need"] = "address"; state["capture_next"] = "address"; await send_text(ws, MSG["ask_address"]); continue
                     if not caller_number and not state["hold_phone"]:
@@ -708,7 +729,7 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                if state.get("need") in {"name","address","phone"} and not state.get("capture_next"):
+                if (state.get("need") in {"name","address","phone"} or state.get("capture_next") in {"name","name_tail"}) and not state.get("capture_next"):
                     state["capture_next"] = state["need"]
                 continue
 
@@ -718,3 +739,11 @@ async def relay(ws: WebSocket):
 
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
+
+
+def _name_tokens(s: str):
+    s = (s or "").strip()
+    s = re.sub(r"[^\wÁÉÍÓÚÜÑáéíóúüñ'\-\s]", " ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'\-]{0,60}", s)
+    return [t for t in toks if len(t) >= 2]
