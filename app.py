@@ -295,7 +295,7 @@ def maybe_extract_name(text: str) -> str | None:
 def maybe_extract_address(text: str) -> str | None:
     m = ADDR_HINT_RE.search(text)
     if m:
-        addr = m.group(2).strip()
+        addr = m.group(1 if "address" in m.group(0).lower() else 2).strip()
         if STREET_RE.search(addr):
             return addr
     m2 = STREET_RE.search(text or "")
@@ -340,6 +340,9 @@ async def voice(_: Request):
       url="{RELAY_WSS_URL}"
       ttsProvider="Amazon"
       voice="Joanna-Neural"
+      interruptible="any"
+      reportInputDuringAgentSpeech="speech"
+      welcomeGreeting="Hi, I’m Chloe. How can I help?"
     />
   </Connect>
 </Response>"""
@@ -420,9 +423,6 @@ async def relay(ws: WebSocket):
 
             if mtype == "setup":
                 caller_number = (msg.get("from") or "").strip() or None
-                if not state["lang"] and not state["lang_prompted"]:
-                    state["lang_prompted"] = True
-                    await send_text(ws, MESSAGES["en"]["lang_choice"])
                 continue
 
             if mtype == "prompt":
@@ -430,6 +430,7 @@ async def relay(ws: WebSocket):
                 if not user_text:
                     continue
                 print("RX:", user_text, flush=True)
+                print(f"FLOW(before): mode={state['mode']} need={state['need']} has={{'date': bool(state['hold_date']), 'time': bool(state['hold_time']), 'name': bool(state['hold_name']), 'addr': bool(state['hold_address'])}}", flush=True)
 
                 # --- Language selection (single-number menu) ---
                 if not state["lang"]:
@@ -496,13 +497,7 @@ async def relay(ws: WebSocket):
                         state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
 
                     if not state["hold_date"]:
-                        state["need"] = "date"
-                        from datetime import datetime as _dt
-                        _now = _dt.now(TZ)
-                        _example_num = _now.strftime("%m/%d")
-                        _ask = "What day works for you?" if lang == 'en' else "¿Qué día te funciona?"
-                        await send_text(ws, _ask)
-                        continue
+                        state["need"] = "date"; await send_text(ws, MSG["ask_date"]); continue
                     if not state["hold_time"]:
                         state["need"] = "time"; await send_text(ws, MSG["ask_time"]); continue
                     if not state["hold_name"]:
@@ -541,17 +536,6 @@ async def relay(ws: WebSocket):
                             continue
                         await send_text(ws, MSG["please_yes_no"]); continue
 
-                if state["mode"] == "booking" and state["need"] == "name":
-                    nm = maybe_extract_name(user_text) or user_text.strip()
-                    if len(nm) >= 2:
-                        state["hold_name"] = nm
-                        state["need"] = "address"
-                        await send_text(ws, MSG["ask_address"])
-                        continue
-                    when_say = when_phrase(state["hold_dt"], lang)
-                    await send_text(ws, MSG["ask_name"].format(when=when_say))
-                    continue
-
                 if state["mode"] == "booking" and state["need"] == "confirm":
                     if YES_RE.search(user_text):
                         start_dt = state["hold_dt"]
@@ -561,8 +545,33 @@ async def relay(ws: WebSocket):
                         await send_text(ws, MSG["booked"].format(when=when_say))
                         state.update({"mode":None, "need":None, "hold_date":None, "hold_time":None, "hold_dt":None, "hold_name":None, "hold_address":None, "hold_phone":None})
                         continue
-                    await send_text(ws, MSG["please_yes_no"])
-                    continue
+                    await send_text(ws, MSG["please_yes_no"]); continue
+
+                # Hard gate: if guided flow is active, skip model fallthrough entirely
+                if state["mode"] in {"booking", "optout"} or state["need"] is not None:
+                    if state["mode"] == "booking":
+                        if not state["hold_date"]:
+                            await send_text(ws, MESSAGES[lang]["ask_date"]) ; continue
+                        if not state["hold_time"]:
+                            await send_text(ws, MESSAGES[lang]["ask_time"]) ; continue
+                        if not state["hold_name"]:
+                            when_say = when_phrase(datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ), lang)
+                            await send_text(ws, MESSAGES[lang]["ask_name"].format(when=when_say)) ; continue
+                        if not state["hold_address"]:
+                            await send_text(ws, MESSAGES[lang]["ask_address"]) ; continue
+                        if not caller_number and not state["hold_phone"]:
+                            await send_text(ws, MESSAGES[lang]["ask_phone"]) ; continue
+                        when_say = when_phrase(datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ), lang)
+                        await send_text(ws, MESSAGES[lang]["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say)) ; state["need"] = "confirm" ; continue
+                    if state["mode"] == "optout":
+                        if not state["hold_name"]:
+                            await send_text(ws, MESSAGES[lang]["opt_start"]) ; continue
+                        if not state["hold_address"]:
+                            await send_text(ws, MESSAGES[lang]["opt_addr"]) ; continue
+                        if not caller_number and not state["hold_phone"]:
+                            await send_text(ws, MESSAGES[lang]["opt_phone"]) ; continue
+                        ph = state["hold_phone"] or caller_number
+                        await send_text(ws, MESSAGES[lang]["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)) ; state["need"] = "confirm" ; continue
 
                 # Normal chat fallthrough (language-aware)
                 try:
@@ -582,6 +591,7 @@ async def relay(ws: WebSocket):
                     ai_text = "I’m having trouble right now. Please say that again." if lang=='en' else "Tengo un problema ahora. Por favor, repite."
 
                 print("TX:", ai_text, flush=True)
+                print(f"FLOW(after): mode={state['mode']} need={state['need']}", flush=True)
                 history.append({"role": "user", "content": user_text})
                 history.append({"role": "assistant", "content": ai_text})
                 await send_text(ws, ai_text)
@@ -589,8 +599,6 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                if not state["lang"]:
-                    await send_text(ws, MESSAGES["en"]["lang_choice"])
                 continue
 
             if mtype == "error":
