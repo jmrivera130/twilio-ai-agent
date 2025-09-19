@@ -295,7 +295,7 @@ def maybe_extract_name(text: str) -> str | None:
 def maybe_extract_address(text: str) -> str | None:
     m = ADDR_HINT_RE.search(text)
     if m:
-        addr = m.group(1 if "address" in m.group(0).lower() else 2).strip()
+        addr = m.group(2).strip()
         if STREET_RE.search(addr):
             return addr
     m2 = STREET_RE.search(text or "")
@@ -340,9 +340,6 @@ async def voice(_: Request):
       url="{RELAY_WSS_URL}"
       ttsProvider="Amazon"
       voice="Joanna-Neural"
-      interruptible="any"
-      reportInputDuringAgentSpeech="speech"
-      welcomeGreeting="Hi, I’m Chloe. How can I help?"
     />
   </Connect>
 </Response>"""
@@ -423,6 +420,9 @@ async def relay(ws: WebSocket):
 
             if mtype == "setup":
                 caller_number = (msg.get("from") or "").strip() or None
+                if not state["lang"] and not state["lang_prompted"]:
+                    state["lang_prompted"] = True
+                    await send_text(ws, MESSAGES["en"]["lang_choice"])
                 continue
 
             if mtype == "prompt":
@@ -496,7 +496,13 @@ async def relay(ws: WebSocket):
                         state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
 
                     if not state["hold_date"]:
-                        state["need"] = "date"; await send_text(ws, MSG["ask_date"]); continue
+                        state["need"] = "date"
+                        from datetime import datetime as _dt
+                        _now = _dt.now(TZ)
+                        _example_num = _now.strftime("%m/%d")
+                        _ask = "What day works for you?" if lang==\'en\' else "¿Qué día te funciona?"
+                        await send_text(ws, _ask)
+                        continue
                     if not state["hold_time"]:
                         state["need"] = "time"; await send_text(ws, MSG["ask_time"]); continue
                     if not state["hold_name"]:
@@ -535,7 +541,18 @@ async def relay(ws: WebSocket):
                             continue
                         await send_text(ws, MSG["please_yes_no"]); continue
 
-                if state["mode"] == "booking" and state["need"] == "confirm":
+                if state["mode"] == "booking" and state["need"] == "name":
+                    nm = maybe_extract_name(user_text) or user_text.strip()
+                    if len(nm) >= 2:
+                        state["hold_name"] = nm
+                        state["need"] = "address"
+                        await send_text(ws, MSG["ask_address"])
+                        continue
+                    when_say = when_phrase(state["hold_dt"], lang)
+                    await send_text(ws, MSG["ask_name"].format(when=when_say))
+                    continue
+
+if state["mode"] == "booking" and state["need"] == "confirm":
                     if YES_RE.search(user_text):
                         start_dt = state["hold_dt"]
                         phone_used = state["hold_phone"] or caller_number
@@ -571,6 +588,8 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
+                if not state["lang"]:
+                    await send_text(ws, MESSAGES["en"]["lang_choice"])
                 continue
 
             if mtype == "error":
