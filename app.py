@@ -360,7 +360,7 @@ async def voice(_: Request):
         voice="Joanna-Neural"
         interruptible="any"
         reportInputDuringAgentSpeech="speech"
-        welcomeGreeting="Hi, I’m Chloe. You can ask questions or say English or Español."
+        welcomeGreeting="Hi, I’m Chloe. You can ask questions or say English or Español." hints="Foreclosure Relief Group, Chloe, consultation, appointment, foreclosure, notice"
         welcomeGreetingInterruptible="speech"
       />
 </Connect>
@@ -435,7 +435,6 @@ async def relay(ws: WebSocket):
         "hold_phone": None,
         "offered_booking": False,
         "capture_next": None,
-        "name_buffer": [],
     }
 
     try:
@@ -453,17 +452,24 @@ async def relay(ws: WebSocket):
                     continue
                 print("RX:", user_text, flush=True)
                 # Active-need gate: satisfy pending field before any other logic
-                if state.get("capture_next") in {"name","address","phone"}:
+                if state.get("capture_next") in {"name","name_tail","address","phone"}:
                     # Force-bind the next utterance to the pending field (handles barge-in)
                     if state["capture_next"] == "name":
-                        nm = (maybe_extract_name(user_text) or user_text).strip(" .,!?:;-\n\t")
-                        if len(nm) >= 2:
-                            state["hold_name"] = nm
+                        toks = _name_tokens(user_text)
+                        if len(toks) >= 2:
+                            state["hold_name"] = f"{toks[0]} {toks[1]}"
+                            state["name_buffer"] = []
                             state["capture_next"] = None
                             state["need"] = "address"
                             await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
                             continue
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])))
+                        if len(toks) == 1:
+                            state["name_buffer"] = [toks[0]]
+                            state["capture_next"] = "name_tail"
+                            await send_text(ws, "Got it — now say your last name.")
+                            continue
+                        when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_say))
                         continue
                     if state["capture_next"] == "name_tail":
                         toks = _name_tokens(user_text)
@@ -484,7 +490,7 @@ async def relay(ws: WebSocket):
                         await send_text(ws, "Please say your last name.")
                         continue
 
-                    if state["capture_next"] == "address":
+if state["capture_next"] == "address":
                         addr = (maybe_extract_address(user_text) or user_text).strip()
                         if is_full_street_address(addr):
                             state["hold_address"] = addr
@@ -591,46 +597,12 @@ async def relay(ws: WebSocket):
                 if OPT_OUT_RE.search(user_text):
                     state.update({"mode":"optout"})
                     if not state["hold_name"]:
-                        state["need"] = "name"; await send_text(ws, MSG["opt_start"]); continue
-                    if not state["hold_address"]:
-                        state["need"] = "address"; await send_text(ws, MSG["opt_addr"]); continue
-                    if not caller_number and not state["hold_phone"]:
-                        state["need"] = "phone"; await send_text(ws, MSG["opt_phone"]); continue
-                    ph = state["hold_phone"] or caller_number
-                    state["need"] = "confirm"; await send_text(ws, MSG["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)); continue
-
-                # Passive capture
-                if not state["hold_name"]:
-                    nm = maybe_extract_name(user_text)
-                    if nm: state["hold_name"] = nm
-                if not state["hold_address"]:
-                    addr = maybe_extract_address(user_text)
-                    if addr: state["hold_address"] = addr
-                if not caller_number and not state["hold_phone"]:
-                    ph = maybe_extract_phone(user_text)
-                    if ph: state["hold_phone"] = ph
-
-                # Booking triggers
-                d, t, dt_comb = extract_datetime(user_text)
-                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
-                yes_after_schedule = bool(YES_RE.search(user_text))
-                datetime_implies_booking = bool(d or t)
-                if state["mode"] is None and (booking_keyword or (state.get("offered_booking") and yes_after_schedule)):
-                    state["mode"] = "booking"
-
-                if state["mode"] == "booking":
-                    if d: state["hold_date"] = d
-                    if t: state["hold_time"] = t
-                    if state["hold_date"] and state["hold_time"]:
-                        state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
-
-                    if not state["hold_date"]:
-                        state["need"] = "date"; await send_text(ws, MSG["ask_date"]); continue
-                    if not state["hold_time"]:
-                        state["need"] = "time"; await send_text(ws, MSG["ask_time"]); continue
-                    if not state["hold_name"]:
+                        
                         state["need"] = "name"; state["capture_next"] = "name"; state["name_buffer"] = []
-                    when_say = when_phrase(state["hold_dt"], lang); await send_text(ws, MSG["ask_name"].format(when=when_say)); continue
+                        when_say = when_phrase(state["hold_dt"], lang)
+                        await send_text(ws, MSG["ask_name"].format(when=when_say))
+                        continue
+
                     if not state["hold_address"]:
                         state["need"] = "address"; state["capture_next"] = "address"; await send_text(ws, MSG["ask_address"]); continue
                     if not caller_number and not state["hold_phone"]:
@@ -684,9 +656,12 @@ async def relay(ws: WebSocket):
                         if not state["hold_time"]:
                             await send_text(ws, MESSAGES[lang]["ask_time"]) ; continue
                         if not state["hold_name"]:
-                            state["need"] = "name"; state["capture_next"] = "name"
-                            when_say = when_phrase(datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ), lang)
-                            await send_text(ws, MESSAGES[lang]["ask_name"].format(when=when_say)) ; continue
+                            
+                        state["need"] = "name"; state["capture_next"] = "name"; state["name_buffer"] = []
+                        when_say = when_phrase(state["hold_dt"], lang)
+                        await send_text(ws, MSG["ask_name"].format(when=when_say))
+                        continue
+
                         if not state["hold_address"]:
                             await send_text(ws, MESSAGES[lang]["ask_address"]) ; continue
                         if not caller_number and not state["hold_phone"]:
@@ -729,7 +704,7 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                if (state.get("need") in {"name","address","phone"} or state.get("capture_next") in {"name","name_tail"}) and not state.get("capture_next"):
+                if state.get("need") in {"name","address","phone"} and not state.get("capture_next"):
                     state["capture_next"] = state["need"]
                 continue
 
@@ -739,11 +714,3 @@ async def relay(ws: WebSocket):
 
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
-
-
-def _name_tokens(s: str):
-    s = (s or "").strip()
-    s = re.sub(r"[^\wÁÉÍÓÚÜÑáéíóúüñ'\-\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'\-]{0,60}", s)
-    return [t for t in toks if len(t) >= 2]
