@@ -44,7 +44,25 @@ SYSTEM_PROMPT_ES = (
 
 # ---------- utils ----------
 async def send_text(ws: WebSocket, text: str):
-    await ws.send_json({"type": "text", "token": text, "last": True})
+    s = (text or "").strip()
+    if not s:
+        return
+    chunks = []
+    buf = ""
+    for token in s.split():
+        if len(buf) + 1 + len(token) > 40:
+            if buf:
+                chunks.append(buf)
+            buf = token
+        else:
+            buf = token if not buf else buf + " " + token
+    if buf:
+        chunks.append(buf)
+    if not chunks:
+        chunks = [s]
+    for c in chunks[:-1]:
+        await ws.send_json({"type": "text", "token": c, "last": False})
+    await ws.send_json({"type": "text", "token": chunks[-1], "last": True})
 
 def _day_path(d: date) -> Path:
     return BOOK_DIR / f"{d.isoformat()}.jsonl"
@@ -342,8 +360,7 @@ async def voice(_: Request):
       voice="Joanna-Neural"
       interruptible="any"
       reportInputDuringAgentSpeech="speech"
-      welcomeGreeting="Hi, I’m Chloe. How can I help?"
-    />
+      welcomeGreeting="Hi, I’m Chloe. How can I help?" welcomeGreeting="Hi, I’m Chloe. Say English or Español." welcomeGreetingInterruptible="speech" reportInputDuringAgentSpeech="speech" interruptible="any"/>
   </Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="text/xml")
@@ -430,6 +447,42 @@ async def relay(ws: WebSocket):
                 if not user_text:
                     continue
                 print("RX:", user_text, flush=True)
+                # Active-need gate: satisfy pending field before any other logic
+                if state.get("need") in {"name","address","phone"}:
+                    need_now = state.get("need")
+                    if need_now == "name":
+                        nm = maybe_extract_name(user_text) or user_text.strip(" .,!?:;-\n\t")
+                        if len(nm) >= 2:
+                            state["hold_name"] = nm
+                            state["need"] = "address"
+                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                            continue
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])))
+                        continue
+                    if need_now == "address":
+                        addr = maybe_extract_address(user_text) or user_text.strip()
+                        if is_full_street_address(addr):
+                            state["hold_address"] = addr
+                            if not (caller_number or state.get("hold_phone")):
+                                state["need"] = "phone"
+                                await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                                continue
+                            state["need"] = "confirm"
+                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=addr, when=when_say))
+                            continue
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                        continue
+                    if need_now == "phone":
+                        ph = maybe_extract_phone(user_text)
+                        if ph:
+                            state["hold_phone"] = ph
+                            state["need"] = "confirm"
+                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=state.get("hold_address") or "", when=when_say))
+                            continue
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                        continue
                 print(f"FLOW(before): mode={state['mode']} need={state['need']} has={{'date': bool(state['hold_date']), 'time': bool(state['hold_time']), 'name': bool(state['hold_name']), 'addr': bool(state['hold_address'])}}", flush=True)
 
                 # --- Language selection (single-number menu) ---
@@ -437,10 +490,18 @@ async def relay(ws: WebSocket):
                     s = user_text.lower()
                     if re.search(r"\besp[aá]nol|spanish|^2\b", s):
                         state["lang"] = "es"
+                        try:
+                            await ws.send_json({"type":"language","ttsLanguage":"es-ES","transcriptionLanguage":"es-ES"})
+                        except Exception:
+                            pass
                         await send_text(ws, MESSAGES["es"]["lang_set_es"]) 
                         continue
                     if re.search(r"\benglish|ingl[eé]s|^1\b", s):
                         state["lang"] = "en"
+                        try:
+                            await ws.send_json({"type":"language","ttsLanguage":"en-US","transcriptionLanguage":"en-US"})
+                        except Exception:
+                            pass
                         await send_text(ws, MESSAGES["en"]["lang_set"]) 
                         continue
                     if not state["lang_prompted"]:
