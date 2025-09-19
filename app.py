@@ -354,14 +354,16 @@ async def voice(_: Request):
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-    <ConversationRelay
-      url="{RELAY_WSS_URL}"
-      ttsProvider="Amazon"
-      voice="Joanna-Neural"
-      interruptible="any"
-      reportInputDuringAgentSpeech="speech"
-      welcomeGreeting="Hi, I’m Chloe. How can I help?" welcomeGreeting="Hi, I’m Chloe. Say English or Español." welcomeGreetingInterruptible="speech" reportInputDuringAgentSpeech="speech" interruptible="any"/>
-  </Connect>
+          <ConversationRelay
+        url="{RELAY_WSS_URL}"
+        ttsProvider="Amazon"
+        voice="Joanna-Neural"
+        interruptible="any"
+        reportInputDuringAgentSpeech="speech"
+        welcomeGreeting="Hi, I’m Chloe. You can ask questions or say English or Español."
+        welcomeGreetingInterruptible="speech"
+      />
+</Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="text/xml")
 
@@ -529,25 +531,25 @@ async def relay(ws: WebSocket):
                 # --- Language selection (single-number menu) ---
                 if not state["lang"]:
                     s = user_text.lower()
-                    if re.search(r"\besp[aá]nol|spanish|^2\b", s):
+                    if re.search(r"esp[aá]nol|spanish|^2", s):
                         state["lang"] = "es"
                         try:
                             await ws.send_json({"type":"language","ttsLanguage":"es-ES","transcriptionLanguage":"es-ES"})
                         except Exception:
                             pass
                         await send_text(ws, MESSAGES["es"]["lang_set_es"])
-            await send_text(ws, "Soy Chloe del Foreclosure Relief Group. Puedo responder preguntas o agendar una consulta. ¿En qué te ayudo?")
-            state["offered_booking"] = True 
+                        await send_text(ws, "Soy Chloe del Foreclosure Relief Group. Puedo responder preguntas o agendar una consulta. ¿En qué te ayudo?")
+                        state["offered_booking"] = True
                         continue
-                    if re.search(r"\benglish|ingl[eé]s|^1\b", s):
+                    if re.search(r"english|ingl[eé]s|^1", s):
                         state["lang"] = "en"
                         try:
                             await ws.send_json({"type":"language","ttsLanguage":"en-US","transcriptionLanguage":"en-US"})
                         except Exception:
                             pass
                         await send_text(ws, MESSAGES["en"]["lang_set"])
-            await send_text(ws, "I’m Chloe with Foreclosure Relief Group. I can answer questions or help schedule a consultation. How can I help?")
-            state["offered_booking"] = True 
+                        await send_text(ws, "I’m Chloe with Foreclosure Relief Group. I can answer questions or help schedule a consultation. How can I help?")
+                        state["offered_booking"] = True
                         continue
                     if not state["lang_prompted"]:
                         state["lang_prompted"] = True
@@ -706,6 +708,8 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
+                if state.get("need") in {"name","address","phone"} and not state.get("capture_next"):
+                    state["capture_next"] = state["need"]
                 continue
 
             if mtype == "error":
