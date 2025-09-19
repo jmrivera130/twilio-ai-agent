@@ -164,12 +164,10 @@ async def voice(_: Request):
 <Response>
   <Connect>
     <ConversationRelay
-      url="{RELAY_WSS_URL}"
+      url="wss://chloe-ai-agent.onrender.com/relay"
       ttsProvider="Amazon"
       voice="{VOICE_OUT}"
       language="en-US"
-      interruptible="any"
-      reportInputDuringAgentSpeech="speech"
       welcomeGreeting="Hi, I’m Chloe. How can I help?"
     />
   </Connect>
