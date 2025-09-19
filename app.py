@@ -500,7 +500,7 @@ async def relay(ws: WebSocket):
                         from datetime import datetime as _dt
                         _now = _dt.now(TZ)
                         _example_num = _now.strftime("%m/%d")
-                        _ask = "What day works for you?" if lang==\'en\' else "¿Qué día te funciona?"
+                        _ask = "What day works for you?" if lang == 'en' else "¿Qué día te funciona?"
                         await send_text(ws, _ask)
                         continue
                     if not state["hold_time"]:
@@ -552,7 +552,7 @@ async def relay(ws: WebSocket):
                     await send_text(ws, MSG["ask_name"].format(when=when_say))
                     continue
 
-if state["mode"] == "booking" and state["need"] == "confirm":
+                if state["mode"] == "booking" and state["need"] == "confirm":
                     if YES_RE.search(user_text):
                         start_dt = state["hold_dt"]
                         phone_used = state["hold_phone"] or caller_number
@@ -561,7 +561,8 @@ if state["mode"] == "booking" and state["need"] == "confirm":
                         await send_text(ws, MSG["booked"].format(when=when_say))
                         state.update({"mode":None, "need":None, "hold_date":None, "hold_time":None, "hold_dt":None, "hold_name":None, "hold_address":None, "hold_phone":None})
                         continue
-                    await send_text(ws, MSG["please_yes_no"]); continue
+                    await send_text(ws, MSG["please_yes_no"])
+                    continue
 
                 # Normal chat fallthrough (language-aware)
                 try:
