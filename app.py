@@ -431,6 +431,8 @@ async def relay(ws: WebSocket):
         "hold_name": None,
         "hold_address": None,
         "hold_phone": None,
+        "offered_booking": False,
+        "capture_next": None,
     }
 
     try:
@@ -448,6 +450,45 @@ async def relay(ws: WebSocket):
                     continue
                 print("RX:", user_text, flush=True)
                 # Active-need gate: satisfy pending field before any other logic
+                if state.get("capture_next") in {"name","address","phone"}:
+                    # Force-bind the next utterance to the pending field (handles barge-in)
+                    if state["capture_next"] == "name":
+                        nm = (maybe_extract_name(user_text) or user_text).strip(" .,!?:;-\n\t")
+                        if len(nm) >= 2:
+                            state["hold_name"] = nm
+                            state["capture_next"] = None
+                            state["need"] = "address"
+                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                            continue
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])))
+                        continue
+                    if state["capture_next"] == "address":
+                        addr = (maybe_extract_address(user_text) or user_text).strip()
+                        if is_full_street_address(addr):
+                            state["hold_address"] = addr
+                            state["capture_next"] = None
+                            if not (caller_number or state.get("hold_phone")):
+                                state["need"] = "phone"; state["capture_next"] = "phone"
+                                await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                                continue
+                            state["need"] = "confirm"
+                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=addr, when=when_say))
+                            continue
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                        continue
+                    if state["capture_next"] == "phone":
+                        ph = maybe_extract_phone(user_text)
+                        if ph:
+                            state["hold_phone"] = ph
+                            state["capture_next"] = None
+                            state["need"] = "confirm"
+                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=state.get("hold_address") or "", when=when_say))
+                            continue
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                        continue
+                # Fallback: legacy need-gate (still helpful if capture_next not set)
                 if state.get("need") in {"name","address","phone"}:
                     need_now = state.get("need")
                     if need_now == "name":
@@ -494,7 +535,9 @@ async def relay(ws: WebSocket):
                             await ws.send_json({"type":"language","ttsLanguage":"es-ES","transcriptionLanguage":"es-ES"})
                         except Exception:
                             pass
-                        await send_text(ws, MESSAGES["es"]["lang_set_es"]) 
+                        await send_text(ws, MESSAGES["es"]["lang_set_es"])
+            await send_text(ws, "Soy Chloe del Foreclosure Relief Group. Puedo responder preguntas o agendar una consulta. ¿En qué te ayudo?")
+            state["offered_booking"] = True 
                         continue
                     if re.search(r"\benglish|ingl[eé]s|^1\b", s):
                         state["lang"] = "en"
@@ -502,7 +545,9 @@ async def relay(ws: WebSocket):
                             await ws.send_json({"type":"language","ttsLanguage":"en-US","transcriptionLanguage":"en-US"})
                         except Exception:
                             pass
-                        await send_text(ws, MESSAGES["en"]["lang_set"]) 
+                        await send_text(ws, MESSAGES["en"]["lang_set"])
+            await send_text(ws, "I’m Chloe with Foreclosure Relief Group. I can answer questions or help schedule a consultation. How can I help?")
+            state["offered_booking"] = True 
                         continue
                     if not state["lang_prompted"]:
                         state["lang_prompted"] = True
@@ -548,7 +593,7 @@ async def relay(ws: WebSocket):
                 booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
                 yes_after_schedule = bool(YES_RE.search(user_text))
                 datetime_implies_booking = bool(d or t)
-                if state["mode"] is None and (booking_keyword or yes_after_schedule or datetime_implies_booking):
+                if state["mode"] is None and (booking_keyword or (state.get("offered_booking") and yes_after_schedule)):
                     state["mode"] = "booking"
 
                 if state["mode"] == "booking":
@@ -562,11 +607,11 @@ async def relay(ws: WebSocket):
                     if not state["hold_time"]:
                         state["need"] = "time"; await send_text(ws, MSG["ask_time"]); continue
                     if not state["hold_name"]:
-                        state["need"] = "name"; when_say = when_phrase(state["hold_dt"], lang); await send_text(ws, MSG["ask_name"].format(when=when_say)); continue
+                        state["need"] = "name"; state["capture_next"] = "name"; when_say = when_phrase(state["hold_dt"], lang); await send_text(ws, MSG["ask_name"].format(when=when_say)); continue
                     if not state["hold_address"]:
-                        state["need"] = "address"; await send_text(ws, MSG["ask_address"]); continue
+                        state["need"] = "address"; state["capture_next"] = "address"; await send_text(ws, MSG["ask_address"]); continue
                     if not caller_number and not state["hold_phone"]:
-                        state["need"] = "phone"; await send_text(ws, MSG["ask_phone"]); continue
+                        state["need"] = "phone"; state["capture_next"] = "phone"; await send_text(ws, MSG["ask_phone"]); continue
                     state["need"] = "confirm"; when_say = when_phrase(state["hold_dt"], lang)
                     await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say)); continue
 
@@ -616,6 +661,7 @@ async def relay(ws: WebSocket):
                         if not state["hold_time"]:
                             await send_text(ws, MESSAGES[lang]["ask_time"]) ; continue
                         if not state["hold_name"]:
+                            state["need"] = "name"; state["capture_next"] = "name"
                             when_say = when_phrase(datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ), lang)
                             await send_text(ws, MESSAGES[lang]["ask_name"].format(when=when_say)) ; continue
                         if not state["hold_address"]:
