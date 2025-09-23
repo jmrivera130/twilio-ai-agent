@@ -497,112 +497,111 @@ async def relay(ws: WebSocket):
                 if not user_text:
                     continue
                 print("RX:", user_text, flush=True)
+                
                 # Active-need gate: satisfy pending field before any other logic
-                if state.get("capture_next") in {"name","address","phone"}:
-                    # Force-bind the next utterance to the pending field (handles barge-in)
-                    if state["capture_next"] == "name":
-                    if not state.get("name_collector"):
-                        state["name_collector"] = NameCollector()
-                    done, full = state["name_collector"].observe(user_text)
-                    if done and full:
-                        state["hold_name"] = full
-                        state["capture_next"] = None
-                        state["need"] = "address"
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
-                        continue
-                    if state["name_collector"].need_tail():
-                        await send_text(ws, "Got it — now say your last name.")
-                        continue
-                    if state["name_collector"].repeats >= 2:
-                        await send_text(ws, "I heard your name as " + (state["name_collector"].first or "") + ". If that is your full name, say yes; otherwise add your last name.")
-                        continue
-                    when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
-                    await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_say))
-                    continue
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])))
-                        continue
-                    if state["capture_next"] == "name_tail":
-                        toks = _name_tokens(user_text)
-                        if len(toks) >= 1 and state.get("name_buffer"):
-                            state["hold_name"] = f"{state["name_buffer"][0]} {toks[0]}"
-                            state["name_buffer"] = []
+                # ---------- active slot capture ----------
+                if state.get("capture_next") in {"name", "name_tail", "address", "phone"}:
+                    cap = state["capture_next"]
+
+                    # NAME (interruption-aware, two-turn)
+                    if cap == "name":
+                        if not state.get("name_collector"):
+                            state["name_collector"] = NameCollector()
+                        done, full = state["name_collector"].observe(user_text)
+
+                        if done and full:
+                            # got "First Last"
+                            state["hold_name"] = full
                             state["capture_next"] = None
                             state["need"] = "address"
                             await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
                             continue
-                        if len(toks) >= 2:
-                            state["hold_name"] = f"{toks[0]} {toks[1]}"
-                            state["name_buffer"] = []
-                            state["capture_next"] = None
-                            state["need"] = "address"
-                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+
+                        if state["name_collector"].need_tail():
+                            # we have First, bind for Last
+                            await send_text(ws, "Got it — now say your last name.")
+                            state["capture_next"] = "name"   # keep binder active
                             continue
-                        await send_text(ws, "Please say your last name.")
+
+                        if state["name_collector"].repeats >= 2:
+                            # single token repeated — offer confirm
+                            first_only = state["name_collector"].first or ""
+                            await send_text(ws, f"I heard your name as {first_only}. If that is your full name, say yes; otherwise add your last name.")
+                            state["capture_next"] = "name"
+                            continue
+
+                        # fallback re-ask (rare)
+                        when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_say))
+                        state["capture_next"] = "name"
                         continue
 
-                    if state["capture_next"] == "address":
+                    # ADDRESS
+                    if cap == "address":
                         addr = (maybe_extract_address(user_text) or user_text).strip()
                         if is_full_street_address(addr):
                             state["hold_address"] = addr
                             state["capture_next"] = None
-                            if not (caller_number or state.get("hold_phone")):
-                                state["need"] = "phone"; state["capture_next"] = "phone"
+                            state["need"] = "phone" if (not caller_number and not state["hold_phone"]) else "confirm"
+                            if state["need"] == "phone":
                                 await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
                                 continue
-                            state["need"] = "confirm"
-                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=addr, when=when_say))
+                            when_say = when_phrase(state["hold_dt"], state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
+                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
+
                         await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                        state["capture_next"] = "address"
                         continue
-                    if state["capture_next"] == "phone":
+
+                    # PHONE
+                    if cap == "phone":
                         ph = maybe_extract_phone(user_text)
                         if ph:
                             state["hold_phone"] = ph
                             state["capture_next"] = None
                             state["need"] = "confirm"
-                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=state.get("hold_address") or "", when=when_say))
+                            when_say = when_phrase(state["hold_dt"], state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
+                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
+
                         await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                        state["capture_next"] = "phone"
                         continue
+
                 # Fallback: legacy need-gate (still helpful if capture_next not set)
-                if state.get("need") in {"name","address","phone"}:
-                    need_now = state.get("need")
-                    if need_now == "name":
-                        nm = maybe_extract_name(user_text) or user_text.strip(" .,!?:;-\n\t")
-                        if len(nm) >= 2:
-                            state["hold_name"] = nm
-                            state["need"] = "address"
-                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
-                            continue
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])))
-                        continue
+                # ---------- legacy slot fallback (address/phone only) ----------
+                if state.get("need") in {"address", "phone"}:
+                    need_now = state["need"]
+
                     if need_now == "address":
-                        addr = maybe_extract_address(user_text) or user_text.strip()
+                        addr = (maybe_extract_address(user_text) or user_text).strip()
                         if is_full_street_address(addr):
                             state["hold_address"] = addr
-                            if not (caller_number or state.get("hold_phone")):
-                                state["need"] = "phone"
+                            state["need"] = "phone" if (not caller_number and not state["hold_phone"]) else "confirm"
+                            if state["need"] == "phone":
                                 await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
                                 continue
-                            state["need"] = "confirm"
-                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=addr, when=when_say))
+                            when_say = when_phrase(state["hold_dt"], state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
+                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
                         await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
                         continue
+
                     if need_now == "phone":
                         ph = maybe_extract_phone(user_text)
                         if ph:
                             state["hold_phone"] = ph
                             state["need"] = "confirm"
-                            when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(name=state.get("hold_name") or "", addr=state.get("hold_address") or "", when=when_say))
+                            when_say = when_phrase(state["hold_dt"], state["lang"])
+                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
+                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
                         await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
                         continue
-                print(f"FLOW(before): mode={state['mode']} need={state['need']} has={{'date': bool(state['hold_date']), 'time': bool(state['hold_time']), 'name': bool(state['hold_name']), 'addr': bool(state['hold_address'])}}", flush=True)
 
                 # --- Language selection (single-number menu) ---
                 if not state["lang"]:
@@ -701,17 +700,14 @@ async def relay(ws: WebSocket):
                 # Hard gate: if guided flow is active, skip model fallthrough entirely
                 if state["mode"] in {"booking", "optout"} or state["need"] is not None:
                     if state["mode"] == "booking":
-                        if not state["hold_date"]:
-                            await send_text(ws, MESSAGES[lang]["ask_date"]) ; continue
-                        if not state["hold_time"]:
-                            await send_text(ws, MESSAGES[lang]["ask_time"]) ; continue
                         if not state["hold_name"]:
-                        state["need"] = "name"
-                        state["capture_next"] = "name"
-                        state["name_collector"] = NameCollector()
-                        when_say = when_phrase(state["hold_dt"], lang)
-                        await send_text(ws, MSG["ask_name"].format(when=when_say))
-                        continue
+                            state["need"] = "name"
+                            state["capture_next"] = "name"
+                            state["name_collector"] = NameCollector()
+                            when_say = when_phrase(state["hold_dt"], lang)
+                            await send_text(ws, MSG["ask_name"].format(when=when_say))
+                            continue
+
                         if not state["hold_address"]:
                             await send_text(ws, MESSAGES[lang]["ask_address"]) ; continue
                         if not caller_number and not state["hold_phone"]:
