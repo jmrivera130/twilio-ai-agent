@@ -64,6 +64,14 @@ async def send_text(ws: WebSocket, text: str):
         await ws.send_json({"type": "text", "token": c, "last": False})
     await ws.send_json({"type": "text", "token": chunks[-1], "last": True})
 
+async def set_cr_language(ws: WebSocket, tts: str, stt: str):
+    # Twilio ConversationRelay WS message to switch TTS/STT mid-call
+    await ws.send_json({
+        "type": "language",
+        "ttsLanguage": tts,
+        "transcriptionLanguage": stt
+    })
+
 def _day_path(d: date) -> Path:
     return BOOK_DIR / f"{d.isoformat()}.jsonl"
 
@@ -395,19 +403,19 @@ def when_phrase(dt: datetime, lang: str = "en") -> str:
 # ---------- HTTP: Twilio hits /voice (unchanged TwiML except URL/voice come from your env/code) ----------
 @app.post("/voice")
 async def voice(_: Request):
+    # Minimal, fast TwiML for ConversationRelay (no blocking, returns immediately)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
-          <ConversationRelay
-        url="{RELAY_WSS_URL}"
-        ttsProvider="Amazon"
-        voice="Joanna-Neural"
-        interruptible="any"
-        reportInputDuringAgentSpeech="speech"
-        welcomeGreeting="Hi, I’m Chloe. You can ask questions or say English or Español." hints="Foreclosure Relief Group, Chloe, consultation, appointment, foreclosure, notice, John, Smith, Maria, Garcia, Nguyen, Patel"
-        welcomeGreetingInterruptible="speech"
-      />
-</Connect>
+    <ConversationRelay
+      url="{RELAY_WSS_URL}"
+      ttsProvider="Amazon"
+      voice="Joanna-Neural"
+      reportInputDuringAgentSpeech="speech"
+      interruptible="any"
+      hints="Foreclosure, Foreclosure Relief Group, consultation, address, appointment, cita, español, English, John, Smith, Snow, Lopez"
+    />
+  </Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="text/xml")
 
@@ -606,32 +614,30 @@ async def relay(ws: WebSocket):
                 # --- Language selection (single-number menu) ---
                 if not state["lang"]:
                     s = user_text.lower()
-                    if re.search(r"esp[aá]nol|spanish|^2", s):
+                    if re.search(r"\b(esp[aá]nol|spanish|2)\b", s):
                         state["lang"] = "es"
-                        try:
-                            await ws.send_json({"type":"language","ttsLanguage":"es-ES","transcriptionLanguage":"es-ES"})
-                        except Exception:
-                            pass
+                        await set_cr_language(ws, "es-ES", "es-ES")
                         await send_text(ws, MESSAGES["es"]["lang_set_es"])
                         await send_text(ws, "Soy Chloe del Foreclosure Relief Group. Puedo responder preguntas o agendar una consulta. ¿En qué te ayudo?")
                         state["offered_booking"] = True
                         continue
-                    if re.search(r"english|ingl[eé]s|^1", s):
+
+                    if re.search(r"\b(english|ingl[eé]s|1)\b", s):
                         state["lang"] = "en"
-                        try:
-                            await ws.send_json({"type":"language","ttsLanguage":"en-US","transcriptionLanguage":"en-US"})
-                        except Exception:
-                            pass
+                        await set_cr_language(ws, "en-US", "en-US")
                         await send_text(ws, MESSAGES["en"]["lang_set"])
                         await send_text(ws, "I’m Chloe with Foreclosure Relief Group. I can answer questions or help schedule a consultation. How can I help?")
                         state["offered_booking"] = True
                         continue
+
                     if not state["lang_prompted"]:
                         state["lang_prompted"] = True
                         await send_text(ws, MESSAGES["en"]["lang_choice"]) 
                         continue
                     # If still unknown after prompt, default to English
                     state["lang"] = "en"
+                    await set_cr_language(ws, "en-US", "en-US")
+
 
                 lang = state["lang"]
                 MSG = MESSAGES[lang]
