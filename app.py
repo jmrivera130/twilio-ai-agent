@@ -32,6 +32,8 @@ RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ    = os.environ.get("TIMEZONE", "America/Los_Angeles")
 VECTOR_STORE_ID= os.environ.get("VECTOR_STORE_ID", "")
 ORG_NAME       = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
+APP_VERSION = os.environ.get("APP_VERSION", "local")
+print(f"APP_VERSION={APP_VERSION}  RELAY_WSS_URL={RELAY_WSS_URL}  TZ={BUSINESS_TZ}", flush=True)
 TZ = ZoneInfo(BUSINESS_TZ)
 
 # ---------- Storage ----------
