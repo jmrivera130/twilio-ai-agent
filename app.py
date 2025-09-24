@@ -198,23 +198,23 @@ async def report_day(day: str):
 
 # ---------- OpenAI glue ----------
 SYSTEM_EN = (
-    "You are Chloe from " + ORG_NAME + ". Be warm, concise (1–2 short sentences). "
-    "Detect and honor the caller's chosen language (English or Spanish) and keep it consistent. "
-    "Answer questions from the provided documents using file_search with citations when possible. "
-    "Offer to schedule a consultation when appropriate. "
-    "When you have enough details, call the book_appointment tool. "
-    "If the caller asks to be removed, call the mark_opt_out tool. "
-    "Before calling any tool, explicitly confirm the key details in one sentence and wait for 'yes' or 'no'."
+    "You are Chloe from " + ORG_NAME + ". Be warm and concise (≤2 short sentences). "
+    "Keep the entire call in the caller’s chosen language (English or Spanish). "
+    "Use file_search on the attached documents to answer questions accurately; cite briefly when helpful. "
+    "Only propose scheduling after the caller asks for next steps, asks to speak to a person, or confirms they want an appointment. "
+    "Before calling any tool, summarize the details you heard in ONE sentence and ask for a clear yes/no. "
+    "If the caller changes topic mid-flow, gracefully pivot—do NOT repeat prior prompts. "
+    "Never ask for the same field more than twice; if unclear, acknowledge and move on to clarify later."
 )
 
 SYSTEM_ES = (
-    "Eres Chloe de " + ORG_NAME + ". Habla de forma cálida y concisa (1–2 frases). "
-    "Respeta el idioma elegido por la persona (inglés o español) y mantén la coherencia. "
-    "Responde usando los documentos (file_search) con citas cuando sea posible. "
-    "Ofrece agendar una consulta cuando corresponda. "
-    "Cuando tengas suficientes datos, usa la herramienta book_appointment. "
-    "Si la persona pide no ser contactada, usa mark_opt_out. "
-    "Antes de usar cualquier herramienta, confirma los datos clave en una sola frase y espera 'sí' o 'no'."
+    "Eres Chloe de " + ORG_NAME + ". Sé cálida y concisa (≤2 frases). "
+    "Mantén toda la llamada en el idioma elegido (inglés o español). "
+    "Usa file_search en los documentos adjuntos para responder con precisión; incluye una cita breve cuando ayude. "
+    "Propón agendar solo cuando la persona pida próximos pasos, quiera hablar con alguien o confirme que desea una cita. "
+    "Antes de usar cualquier herramienta, resume los datos en UNA frase y pide un sí/no claro. "
+    "Si la persona cambia de tema, cambia con naturalidad—NO repitas solicitudes previas. "
+    "Nunca pidas el mismo dato más de dos veces; si no está claro, reconoce y avanza para aclararlo luego."
 )
 
 TOOLS = [
@@ -297,6 +297,9 @@ def output_text(resp_obj) -> str:
 async def relay(ws: WebSocket):
     await ws.accept()
     print("ConversationRelay: connected", flush=True)
+        # Running conversation state for this WS session
+    history: list[dict] = []
+
 
     # Minimal local state (the model leads the dialog; we just switch language and execute tools)
     caller_number = None
@@ -338,17 +341,18 @@ async def relay(ws: WebSocket):
                     extra_body = {"attachments": [{"vector_store_id": VECTOR_STORE_ID}]}
 
                 try:
+                    # Append new user turn to history BEFORE calling the model
+                    history.append({"role": "user", "content": utter})
+
                     resp = client.responses.create(
                         model="gpt-4o-mini",
-                        input=[
-                            {"role":"system","content": system},
-                            {"role":"user","content": utter},
-                        ],
+                        input=[{"role": "system", "content": system}, *history[-20:]],  # keep last ~20 turns
                         tools=TOOLS,
-                        max_output_tokens=200,
+                        max_output_tokens=220,
                         temperature=0.3,
-                        extra_body=extra_body or None,
+                        extra_body=({"attachments": [{"vector_store_id": VECTOR_STORE_ID}]} if VECTOR_STORE_ID else None),
                     )
+
                 except Exception as e:
                     print("OpenAI error:", repr(e), flush=True)
                     await send_text(ws, "I’m having trouble right now. Could you please repeat?")
@@ -384,31 +388,55 @@ async def relay(ws: WebSocket):
                         else:
                             result = {"ok": False, "error": f"unknown_tool: {name}"}
 
-                        # Send tool result back to the model for a final message
-                        try:
-                            follow = client.responses.create(
-                                model="gpt-4o-mini",
-                                input=[
-                                    {"role":"system","content": system},
-                                    {"role":"assistant","content": [{"type":"tool_result","tool_name": name, "tool_call_id": tc.get("id"), "content": json.dumps(result)}]},
-                                ],
-                                max_output_tokens=140,
-                                temperature=0.2,
-                            )
-                            final_text = output_text(follow)
-                            await send_text(ws, final_text or "Done.")
-                        except Exception as e:
-                            print("OpenAI follow-up error:", repr(e), flush=True)
-                            await send_text(ws, "Thanks, noted.")
+                        # 1) Record the assistant's tool call in history so the model can follow up coherently
+                        tool_name = name
+                        tool_id = tc.get("id") or uuid.uuid4().hex  # tolerate missing id
+
+                        history.append({
+                            "role": "assistant",
+                            "content": [{
+                                "type": "tool_call",
+                                "id": tool_id,
+                                "name": tool_name,
+                                "arguments": json.dumps(args, ensure_ascii=False)
+                            }]
+                        })
+
+                        # 2) Record the tool result turn
+                        history.append({
+                            "role": "tool",
+                            "content": json.dumps(result, ensure_ascii=False),
+                            "name": tool_name,
+                            "tool_call_id": tool_id
+                        })
+
+                        # 3) Ask the model for the final confirmation/message with full history
+                        follow = client.responses.create(
+                            model="gpt-4o-mini",
+                            input=[{"role":"system","content": system}, *history[-20:]],
+                            max_output_tokens=160,
+                            temperature=0.2,
+                            tools=TOOLS,  # keep tools attached in case the model wants to chain
+                            extra_body=({"attachments": [{"vector_store_id": VECTOR_STORE_ID}]} if VECTOR_STORE_ID else None),
+                        )
+                        final_text = output_text(follow) or "Done."
+                        history.append({"role": "assistant", "content": final_text})
+                        await send_text(ws, final_text)
+
                     continue
 
                 # No tools—send the model’s direct answer
                 text = output_text(resp) or "Sorry, could you say that again?"
+                history.append({"role": "assistant", "content": text})
                 await send_text(ws, text)
                 continue
 
             if mtype == "interrupt":
-                print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
+                # Log and gently reset: add a brief assistant ack so the model understands we paused
+                cut = (msg.get("utteranceUntilInterrupt") or "").strip()
+                print("Interrupted:", cut, flush=True)
+                # Optional: mark in history for clarity (developer/meta role not always supported; use assistant)
+                history.append({"role": "assistant", "content": "Understood—go ahead."})
                 continue
 
             if mtype == "error":
