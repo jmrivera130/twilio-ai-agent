@@ -1,7 +1,9 @@
-# app.py — FastAPI + Twilio ConversationRelay (2025) + OpenAI
-# Phased flow: language → intro → Q&A → booking → outro, with recoverable slots and no loops.
-# Uses Twilio ConversationRelay 2025 features: reportInputDuringAgentSpeech, <Language> mapping, WS language message.
-# Keeps /voice tiny to avoid 11205 (hard 15s webhook cap).
+# app.py — FastAPI + Twilio ConversationRelay (Sept 2025) + OpenAI
+# Five-phase flow with "snap-out" safety: 
+#   1) language → 2) intro → 3) qna (info) ↔ 4) booking → 5) confirm/outro
+# Robust phase switching: caller can ask info during booking (jump back to qna), or ask to talk to a person (route to booking).
+# Name/address/phone collectors are interruption-aware; bounded retries avoid loops.
+# /voice TwiML is minimal to satisfy Twilio's voice webhook timeout; <Language> entries and mid-call language switch supported.
 
 import os, re, json, uuid
 from datetime import datetime, date, time, timedelta
@@ -151,7 +153,11 @@ def render_report_csv(day: date) -> str:
 WEEKDAYS = {"monday":0,"tuesday":1,"wednesday":2,"thursday":3,"friday":4,"saturday":5,"sunday":6,
             "lunes":0,"martes":1,"miercoles":2,"miércoles":2,"jueves":3,"viernes":4,"sabado":5,"sábado":5,"domingo":6}
 MONTHS = {"january":1,"february":2,"march":3,"april":4,"may":5,"june":6,"july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
-          "enero":1,"febrero":2,"marzo":3,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
+          "enero":1,"febrero":2,"marzo":2,"abril":4,"mayo":5,"junio":6,"julio":7,"agosto":8,"septiembre":9,"setiembre":9,"octubre":10,"noviembre":11,"diciembre":12}
+
+# Fix Spanish month mapping error above (marzo=3)
+MONTHS["marzo"] = 3
+
 
 def _next_weekday(now_dt: datetime, target: int) -> date:
     days_ahead = (target - now_dt.weekday()) % 7
@@ -244,11 +250,12 @@ def extract_datetime(text: str):
         return d, t, datetime.combine(d, t, tzinfo=TZ)
     return d, t, None
 
-# ---------- helpers: booking & opt-out detection ----------
+# ---------- helpers: intent & slot detection ----------
 BOOKING_KEYWORDS_RE = re.compile(r"\b(book|appointment|schedule|set up|meeting|consult|cita|agendar|programar)\b", re.I)
 YES_RE = re.compile(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|ok|okay|si|sí|claro|correcto|de acuerdo)\b", re.I)
-SCHEDULING_HINT_RE = re.compile(r"\b(schedule|book|appointment|set up|consult|cita|agendar|programar)\b", re.I)
 OPT_OUT_RE = re.compile(r"\b(opt\s*out|do\s*not\s*contact|do\s*not\s*call|don't\s*call|do not call|stop|unsubscribe|remove me|take me off|no me llames|no me contacten|quitar|baja)\b", re.I)
+INFO_INTENT_RE = re.compile(r"\b(what\s+is\s+this\s+about|what\s+is\s+this|what\s+is\s+it\s+about|what's\s+this|que\s+es\s+esto|qué\s+es\s+esto|explica|explain|information|info|details)\b|\?", re.I)
+HUMAN_INTENT_RE = re.compile(r"\b(human|agent|representative|person|alguien|agente|humano)\b", re.I)
 
 NAME_RE = re.compile(r"\b(my name is|this is|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.\-'\s]{1,60})\b", re.I)
 ADDR_HINT_RE = re.compile(r"\b(address|property address|the address|la direccion|la dirección|la propiedad)\s*(?:is|es|:)?\s*(.+)", re.I)
@@ -274,7 +281,9 @@ MESSAGES = {
         "opt_confirm": "Confirm do-not-contact for {name} at {addr}, phone {phone}. Is that correct?",
         "opt_done": "You’re marked do-not-contact. Anything else?",
         "please_yes_no": "Please say yes or no to confirm.",
-        "outro": "Thanks for calling. If you need anything else, just say so."
+        "outro": "Thanks for calling. If you need anything else, just say so.",
+        "last_name_prompt": "Got it — now say your last name.",
+        "name_confirm_hint": "If that is your full name, say yes; otherwise add your last name.",
     },
     "es": {
         "lang_choice": "Di 'English' o 'Español' para continuar.",
@@ -294,7 +303,9 @@ MESSAGES = {
         "opt_confirm": "Confirma no-contactar para {name} en {addr}, teléfono {phone}. ¿Correcto?",
         "opt_done": "Quedaste en no-contactar. ¿Algo más?",
         "please_yes_no": "Por favor di sí o no para confirmar.",
-        "outro": "Gracias por llamar. Si necesitas algo más, dímelo."
+        "outro": "Gracias por llamar. Si necesitas algo más, dímelo.",
+        "last_name_prompt": "Entendido — ahora di tu apellido.",
+        "name_confirm_hint": "Si ese es tu nombre completo, di sí; si no, agrega tu apellido.",
     }
 }
 
@@ -376,7 +387,7 @@ def when_phrase(dt: datetime, lang: str = "en") -> str:
 # ---------- HTTP: Twilio hits /voice (tiny TwiML) ----------
 @app.post("/voice")
 async def voice(_: Request):
-    # Minimal TwiML, immediate return (hard 15s Twilio limit for voice webhooks)
+    # Minimal TwiML, immediate return (Twilio voice webhooks have a strict time cap)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -466,7 +477,7 @@ async def relay(ws: WebSocket):
         "need": None,         # None | "date" | "time" | "name" | "address" | "phone" | "confirm"
         "capture_next": None, # None | "name" | "address" | "phone"
         "name_collector": None,
-        "offered_booking": False,
+        "intro_done": False,
 
         "hold_date": None,
         "hold_time": None,
@@ -493,7 +504,7 @@ async def relay(ws: WebSocket):
                     continue
                 print(f"RX: {user_text} | phase={state['phase']} need={state['need']} cap={state['capture_next']}", flush=True)
 
-                # --- Language selection (single-number menu) ---
+                # --- Phase 1: Language selection ---
                 if not state["lang"]:
                     s = user_text.lower()
                     if re.search(r"\b(esp[aá]nol|spanish|2)\b", s):
@@ -501,7 +512,6 @@ async def relay(ws: WebSocket):
                         await set_cr_language(ws, "es-ES", "es-ES")
                         await send_text(ws, MESSAGES["es"]["lang_set_es"])
                         await send_text(ws, MESSAGES["es"]["intro"])
-                        state["offered_booking"] = True
                         state["phase"] = "qna"
                         continue
                     if re.search(r"\b(english|ingl[eé]s|1)\b", s):
@@ -509,18 +519,16 @@ async def relay(ws: WebSocket):
                         await set_cr_language(ws, "en-US", "en-US")
                         await send_text(ws, MESSAGES["en"]["lang_set"])
                         await send_text(ws, MESSAGES["en"]["intro"])
-                        state["offered_booking"] = True
                         state["phase"] = "qna"
                         continue
                     if not state["lang_prompted"]:
                         state["lang_prompted"] = True
                         await send_text(ws, MESSAGES["en"]["lang_choice"])
                         continue
-                    # default
+                    # default to English
                     state["lang"] = "en"
                     await set_cr_language(ws, "en-US", "en-US")
                     await send_text(ws, MESSAGES["en"]["intro"])
-                    state["offered_booking"] = True
                     state["phase"] = "qna"
                     continue
 
@@ -528,12 +536,7 @@ async def relay(ws: WebSocket):
                 MSG = MESSAGES[lang]
                 sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT_ES
 
-                # --- Quick date clarification ---
-                if re.search(r"\b(what\s+(date|day)\s+is\s+that|which\s+day\s+is\s+that)\b|\b(qu[eé]\s+fecha|qu[eé]\s+d[ií]a)\b", user_text, re.I):
-                    if state.get("hold_dt"):
-                        await send_text(ws, when_phrase(state["hold_dt"], lang)); continue
-
-                # --- Opt-out anytime ---
+                # ---- Global intents (can snap phases) ----
                 if OPT_OUT_RE.search(user_text):
                     state.update({"mode":"optout"})
                     if not state["hold_name"]:
@@ -548,23 +551,32 @@ async def relay(ws: WebSocket):
                     ph = state["hold_phone"] or caller_number
                     state["need"] = "confirm"; await send_text(ws, MSG["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)); continue
 
-                # ---------- Booking trigger & slot-fill ----------
-                d, t, dt_comb = extract_datetime(user_text)
-                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
-                yes_after_offer = bool(YES_RE.search(user_text) and state.get("offered_booking"))
-                datetime_implies_booking = bool(d or t)
-
-                if state["mode"] is None and (booking_keyword or yes_after_offer or datetime_implies_booking):
+                # HUMAN intent routes to booking (Phase 4)
+                if HUMAN_INTENT_RE.search(user_text):
                     state["mode"] = "booking"
 
+                # Extract date/time early for intent
+                d, t, dt_comb = extract_datetime(user_text)
+                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
+                info_intent = bool(INFO_INTENT_RE.search(user_text))
+
+                # Phase snap logic
+                if state["mode"] == "booking" and info_intent:
+                    # Caller asked info while in booking → snap back to Q&A
+                    state["mode"] = None; state["need"] = None; state["capture_next"] = None
+                    await send_text(ws, "Sure — here’s a quick overview. Feel free to ask follow-ups.")
+                    state["phase"] = "qna"
+
+                if state["mode"] is None and (booking_keyword or d or t):
+                    state["mode"] = "booking"
+
+                # ---------- Phase 4: Booking (slot-fill) ----------
                 if state["mode"] == "booking":
-                    # Cache date/time as we hear them
                     if d: state["hold_date"] = d
                     if t: state["hold_time"] = t
                     if state.get("hold_date") and state.get("hold_time"):
                         state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
 
-                    # Ask for missing pieces in order
                     if not state.get("hold_date"):
                         state["need"] = "date"; state["retries"]=0
                         await send_text(ws, MSG["ask_date"]); continue
@@ -584,22 +596,18 @@ async def relay(ws: WebSocket):
                         state["need"] = "phone"; state["capture_next"]="phone"; state["retries"]=0
                         await send_text(ws, MSG["ask_phone"]); continue
 
-                    # Confirm
                     state["need"] = "confirm"
                     when_say = when_phrase(state["hold_dt"], lang)
                     await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say))
                     continue
 
-                # ---------- Active slot capture (name/address/phone) ----------
+                # ---------- Active slot capture (Phase 4 details) ----------
                 if state.get("capture_next") in {"name", "address", "phone"}:
                     cap = state["capture_next"]
 
-                    # NAME (interruption-aware)
                     if cap == "name":
                         if not state.get("name_collector"):
                             state["name_collector"] = NameCollector()
-
-                        # Accept "yes" to confirm first-only
                         if YES_RE.search(user_text) and state["name_collector"].need_tail():
                             first_only = state["name_collector"].first or ""
                             if first_only:
@@ -610,9 +618,7 @@ async def relay(ws: WebSocket):
                                 await send_text(ws, MSG["ask_address"])
                                 state["capture_next"] = "address"
                                 continue
-
                         done, full = state["name_collector"].observe(user_text)
-
                         if done and full:
                             state["hold_name"] = full
                             print(f"CAPTURED name={state['hold_name']}", flush=True)
@@ -621,32 +627,21 @@ async def relay(ws: WebSocket):
                             await send_text(ws, MSG["ask_address"])
                             state["capture_next"] = "address"
                             continue
-
                         if state["name_collector"].need_tail():
-                            await send_text(ws, "Got it — now say your last name.")
-                            state["capture_next"] = "name"
-                            continue
-
+                            await send_text(ws, MSG["last_name_prompt"]) ; state["capture_next"] = "name" ; continue
                         if state["name_collector"].repeats >= 2:
                             first_only = state["name_collector"].first or ""
-                            await send_text(ws, f"I heard your name as {first_only}. If that is your full name, say yes; otherwise add your last name.")
-                            state["capture_next"] = "name"
-                            continue
-
-                        # fallback re-ask with small retry ceiling
+                            await send_text(ws, f"I heard your name as {first_only}. {MSG['name_confirm_hint']}")
+                            state["capture_next"] = "name" ; continue
                         state["retries"] += 1
                         if state["retries"] > 2:
-                            # soft reset to Q&A to avoid loops
-                            state["mode"] = None; state["need"]=None; state["capture_next"]=None
-                            await send_text(ws, "I might have misheard. How can I help, or would you like to try booking again?")
-                            state["phase"]="qna"
-                            continue
+                            state["mode"] = None; state["need"] = None; state["capture_next"] = None
+                            await send_text(ws, "No worries — we can come back to that. What questions do you have?")
+                            state["phase"] = "qna" ; continue
                         when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), lang)
                         await send_text(ws, MSG["ask_name"].format(when=when_say))
-                        state["capture_next"] = "name"
-                        continue
+                        state["capture_next"] = "name" ; continue
 
-                    # ADDRESS
                     if cap == "address":
                         addr = (maybe_extract_address(user_text) or user_text).strip()
                         if is_full_street_address(addr):
@@ -654,23 +649,18 @@ async def relay(ws: WebSocket):
                             state["capture_next"] = None
                             state["need"] = None
                             if not caller_number and not state.get("hold_phone"):
-                                state["capture_next"] = "phone"
-                                await send_text(ws, MSG["ask_phone"])
-                                continue
-                            # go to confirm
-                            state["mode"]="booking"; state["need"]="confirm"
+                                state["capture_next"] = "phone" ; await send_text(ws, MSG["ask_phone"]) ; continue
+                            state["mode"] = "booking" ; state["need"] = "confirm"
                             when_say = when_phrase(state["hold_dt"], lang) if state.get("hold_dt") else ""
                             await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
                         state["retries"] += 1
                         if state["retries"] > 2:
-                            state["mode"]=None; state["need"]=None; state["capture_next"]=None
-                            await send_text(ws, "I may have misheard the address. We can come back to that—what questions do you have?")
-                            state["phase"]="qna"; continue
-                        await send_text(ws, MSG["ask_address"])
-                        continue
+                            state["mode"] = None; state["need"] = None; state["capture_next"] = None
+                            await send_text(ws, "We can return to the address later. What else can I help with?")
+                            state["phase"] = "qna" ; continue
+                        await send_text(ws, MSG["ask_address"]) ; continue
 
-                    # PHONE
                     if cap == "phone":
                         ph = maybe_extract_phone(user_text)
                         if ph:
@@ -682,39 +672,26 @@ async def relay(ws: WebSocket):
                             continue
                         state["retries"] += 1
                         if state["retries"] > 2:
-                            state["mode"]=None; state["need"]=None; state["capture_next"]=None
+                            state["mode"] = None; state["need"] = None; state["capture_next"] = None
                             await send_text(ws, "Let’s circle back on the number later. What else can I help with?")
-                            state["phase"]="qna"; continue
-                        await send_text(ws, MSG["ask_phone"])
-                        continue
+                            state["phase"] = "qna" ; continue
+                        await send_text(ws, MSG["ask_phone"]) ; continue
 
-                # ---------- Confirm stages ----------
+                # ---------- Phase 5: Confirm ----------
                 if state["mode"] == "booking" and state.get("need") == "confirm":
                     if YES_RE.search(user_text):
                         start_dt = state["hold_dt"] or (datetime.now(TZ) + timedelta(days=1, hours=1))
                         phone_used = state["hold_phone"] or caller_number or ""
-                        rec = save_booking(start_dt, phone_used, state["hold_name"], state["hold_address"])
+                        save_booking(start_dt, phone_used, state["hold_name"], state["hold_address"])
                         when_say = when_phrase(start_dt, lang)
                         await send_text(ws, MSG["booked"].format(when=when_say))
-                        # outro and reset
                         await send_text(ws, MSG["outro"])
                         state.update({"phase":"outro","mode":None,"need":None,"capture_next":None,
                                       "hold_date":None,"hold_time":None,"hold_dt":None,"hold_name":None,"hold_address":None,"hold_phone":None})
                         continue
-                    await send_text(ws, MSG["please_yes_no"]); continue
+                    await send_text(ws, MSG["please_yes_no"]) ; continue
 
-                if state["mode"] == "optout" and state.get("need") == "confirm":
-                    if YES_RE.search(user_text):
-                        ph = state["hold_phone"] or caller_number
-                        save_optout(ph, state["hold_name"], state["hold_address"])
-                        await send_text(ws, MSG["opt_done"])
-                        await send_text(ws, MSG["outro"])
-                        state.update({"phase":"outro","mode":None,"need":None,"capture_next":None,
-                                      "hold_date":None,"hold_time":None,"hold_dt":None,"hold_name":None,"hold_address":None,"hold_phone":None})
-                        continue
-                    await send_text(ws, MSG["please_yes_no"]); continue
-
-                # ---------- Normal Q&A fallthrough (nuance) ----------
+                # ---------- Phase 3: Q&A (nuance) ----------
                 try:
                     resp = client.responses.create(
                         model="gpt-4o-mini",
@@ -726,7 +703,7 @@ async def relay(ws: WebSocket):
                         max_output_tokens=180,
                         temperature=0.3,
                     )
-                    ai_text = (resp.output_text or "").strip() or ( "Sorry, could you repeat that?" if lang=='en' else "¿Podrías repetir, por favor?" )
+                    ai_text = (resp.output_text or "").strip() or ("Sorry, could you repeat that?" if lang=='en' else "¿Podrías repetir, por favor?")
                 except Exception as e:
                     print("OpenAI error:", repr(e), flush=True)
                     ai_text = "I’m having trouble right now. Please say that again." if lang=='en' else "Tengo un problema ahora. Por favor, repite."
@@ -739,7 +716,6 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                # keep binder for current slot
                 if state.get("need") in {"name","address","phone"}:
                     state["capture_next"] = state["need"]
                 continue
