@@ -346,14 +346,19 @@ async def relay(ws: WebSocket):
                 # Append user to history and call the model with running context
                 history.append({"role": "user", "content": user_text})
                 try:
-                    resp = client.responses.create(
-                        model="gpt-4o-mini",
-                        input=[{"role":"system","content": system}, *history[-24:]],
-                        tools=TOOLS,
+                    response = client.responses.create(
+                        model="gpt-4o-mini",  # or your chosen model
+                        input=[
+                            {"role": "system", "content": SYSTEM_PROMPT}, 
+                            *history[-8:], 
+                            {"role": "user", "content": user_text},
+                        ],
+                        tools=[{"type": "file_search"}],
+                        tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}},
                         max_output_tokens=220,
                         temperature=0.3,
-                        extra_body=({"attachments":[{"vector_store_id": VECTOR_STORE_ID}]} if VECTOR_STORE_ID else None),
                     )
+
                 except Exception as e:
                     print("OpenAI error:", repr(e), flush=True)
                     await send_text(ws, "Sorry, I had a problem—could you say that again?")
@@ -417,11 +422,14 @@ async def relay(ws: WebSocket):
                         follow = client.responses.create(
                             model="gpt-4o-mini",
                             input=[{"role":"system","content": system}, *history[-24:]],
-                            tools=TOOLS,
+                            tools=[{"type": "file_search"}, *TOOLS]  # include file_search plus your custom tools
+                                if isinstance(TOOLS, list) else [{"type":"file_search"}],
+                            tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}}
+                                if VECTOR_STORE_ID else None,
                             max_output_tokens=180,
                             temperature=0.2,
-                            extra_body=({"attachments":[{"vector_store_id": VECTOR_STORE_ID}]} if VECTOR_STORE_ID else None),
                         )
+
                         final_text = output_text(follow) or "Done."
                         history.append({"role": "assistant", "content": final_text})
 
