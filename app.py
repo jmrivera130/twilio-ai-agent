@@ -411,10 +411,22 @@ async def voice(_: Request):
       url="{RELAY_WSS_URL}"
       ttsProvider="Amazon"
       voice="Joanna-Neural"
+      language="en-US"
       reportInputDuringAgentSpeech="speech"
       interruptible="any"
-      hints="Foreclosure, Foreclosure Relief Group, consultation, address, appointment, cita, español, English, John, Smith, Snow, Lopez"
-    />
+      hints="Foreclosure, Foreclosure Relief Group, consultation, address, appointment, cita, Español, English, John, Smith, Snow, Lopez">
+      <!-- Predeclare language mappings so runtime WS switches have concrete TTS/STT configs -->
+      <Language code="en-US"
+                ttsProvider="Amazon"
+                voice="Joanna-Neural"
+                transcriptionProvider="Deepgram"
+                speechModel="nova-3-general" />
+      <Language code="es-ES"
+                ttsProvider="Amazon"
+                voice="Conchita-Neural"
+                transcriptionProvider="Deepgram"
+                speechModel="nova-3-general" />
+    </ConversationRelay>
   </Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="text/xml")
@@ -508,13 +520,21 @@ async def relay(ws: WebSocket):
                 
                 # Active-need gate: satisfy pending field before any other logic
                 # ---------- active slot capture ----------
-                if state.get("capture_next") in {"name", "name_tail", "address", "phone"}:
+                if state.get("capture_next") in {"name", "address", "phone"}:
                     cap = state["capture_next"]
 
                     # NAME (interruption-aware, two-turn)
                     if cap == "name":
                         if not state.get("name_collector"):
                             state["name_collector"] = NameCollector()
+                        if YES_RE.search(user_text) and state["name_collector"].need_tail():
+                            first_only = state["name_collector"].first or ""
+                            if first_only:
+                                state["hold_name"] = first_only
+                                state["capture_next"] = None
+                                state["need"] = "address"
+                                await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                                continue
                         done, full = state["name_collector"].observe(user_text)
 
                         if done and full:
@@ -637,7 +657,66 @@ async def relay(ws: WebSocket):
                     # If still unknown after prompt, default to English
                     state["lang"] = "en"
                     await set_cr_language(ws, "en-US", "en-US")
+                # ---------- booking trigger & slot fill (restores mode="booking") ----------
+                # Parse date/time from the user's message and decide whether to enter booking.
+                d, t, dt_comb = extract_datetime(user_text)
+                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
+                yes_after_offer = bool(YES_RE.search(user_text) and state.get("offered_booking"))
+                datetime_implies_booking = bool(d or t)
 
+                # If the user hinted at scheduling or gave date/time, start/continue booking
+                if state["mode"] is None and (booking_keyword or yes_after_offer or datetime_implies_booking):
+                    state["mode"] = "booking"
+
+                # If we are in booking mode, incrementally fill slots
+                if state["mode"] == "booking":
+                    # Cache date/time as we hear them
+                    if d:
+                        state["hold_date"] = d
+                    if t:
+                        state["hold_time"] = t
+                    if state["hold_date"] and state["hold_time"]:
+                        state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+
+                    # Ask for missing pieces, in order: date -> time -> name -> address -> phone -> confirm
+                    if not state.get("hold_date"):
+                        state["need"] = "date"
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_date"])
+                        continue
+
+                    if not state.get("hold_time"):
+                        state["need"] = "time"
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_time"])
+                        continue
+
+                    # Name capture: (re)arm the interruption-aware collector only once
+                    if not state.get("hold_name"):
+                        if state.get("capture_next") != "name":
+                            state["capture_next"] = "name"
+                            state["name_collector"] = NameCollector()
+                        state["need"] = "name"
+                        when_say = when_phrase(state["hold_dt"], state["lang"])
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_say))
+                        continue
+
+                    if not state.get("hold_address"):
+                        state["need"] = "address"
+                        state["capture_next"] = "address"
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                        continue
+
+                    if not caller_number and not state.get("hold_phone"):
+                        state["need"] = "phone"
+                        state["capture_next"] = "phone"
+                        await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                        continue
+
+                    # Have everything -> confirm
+                    state["need"] = "confirm"
+                    when_say = when_phrase(state["hold_dt"], state["lang"])
+                    await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
+                        name=state["hold_name"], addr=state["hold_address"], when=when_say))
+                    continue
 
                 lang = state["lang"]
                 MSG = MESSAGES[lang]
