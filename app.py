@@ -1,27 +1,16 @@
-# app.py — Minimal CR ↔ OpenAI Responses relay with tool-calls + file_search (EN/ES)
-# Sept 2025 pattern: Twilio ConversationRelay handles PSTN+STT+TTS; your app streams
-# user turns to OpenAI Responses (with file_search + function tools). You only execute tools.
+# app.py — Twilio ConversationRelay × OpenAI Responses (Sept 2025)
+# Memory-threaded convo + gentle booking guard to prevent early/accidental booking.
+# EN/ES via <Language> + mid-call switch; Deepgram nova-3 STT; CSV/ICS writes on tool-call.
 #
-# Requirements (pin recent):
+# Requirements:
 #   pip install "openai>=1.52.0" fastapi uvicorn
-#   (Twilio CR runs over plain WebSocket; no Twilio SDK required here.)
-#
-# ENV you must set on Render:
-#   OPENAI_API_KEY = ...
-#   RELAY_WSS_URL  = wss://<your-app>.onrender.com/relay
-#   TIMEZONE       = America/Los_Angeles
-#   VECTOR_STORE_ID= vs_...   # your OpenAI vector store with PDFs (optional but recommended)
-#   ORG_NAME       = Foreclosure Relief Group
-#
-# Notes:
-# - We keep TwiML minimal and valid for CR; STT = Deepgram nova-3-general, EN+ES languages.
-# - We DO NOT send SMS. All messages are CR WebSocket JSON (type="text").
-# - Tool calls: book_appointment, mark_opt_out. We validate args, write JSONL/CSV/ICS, and respond.
-# - Name loops die because the model owns slotting; we only confirm before saving.
+# Env on Render:
+#   OPENAI_API_KEY, RELAY_WSS_URL=wss://<app>.onrender.com/relay, TIMEZONE=America/Los_Angeles
+#   VECTOR_STORE_ID=vs_... (optional), ORG_NAME=Foreclosure Relief Group
 
 from __future__ import annotations
 import os, json, uuid, re
-from datetime import datetime, timedelta, date, time
+from datetime import datetime, timedelta, date
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,7 +20,7 @@ from openai import OpenAI
 
 # ---------- ENV ----------
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
-RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]            # wss://<your-app>.onrender.com/relay
+RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ    = os.environ.get("TIMEZONE", "America/Los_Angeles")
 VECTOR_STORE_ID= os.environ.get("VECTOR_STORE_ID", "")
 ORG_NAME       = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
@@ -74,7 +63,6 @@ def _write_jsonl(day: date, rec: dict):
 
 
 def save_booking(args: dict) -> dict:
-    # Expected: iso_start, name, address, phone, duration_min(optional)
     sid = uuid.uuid4().hex[:12]
     start = datetime.fromisoformat(args["iso_start"]).astimezone(TZ)
     dur = int(args.get("duration_min", 30))
@@ -98,7 +86,6 @@ def save_booking(args: dict) -> dict:
     )
     (ICS_DIR / f"{sid}.ics").write_text(ics_text, encoding="utf-8")
     _write_jsonl(start.date(), rec)
-    # mirror to today for day-end CSV convenience
     try:
         mirror = dict(rec); mirror["note"] = (mirror.get("note") or "") + "; mirror=true"
         _write_jsonl(datetime.now(TZ).date(), mirror)
@@ -150,7 +137,6 @@ def render_csv(d: date) -> str:
 # ---------- HTTP: TwiML + reports ----------
 @app.post("/voice")
 async def voice(_: Request):
-    # Minimal, current CR TwiML with Deepgram nova-3 and EN/ES language entries.
     twiml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <Response>
   <Connect>
@@ -201,7 +187,7 @@ SYSTEM_EN = (
     "You are Chloe from " + ORG_NAME + ". Be warm and concise (≤2 short sentences). "
     "Keep the entire call in the caller’s chosen language (English or Spanish). "
     "Use file_search on the attached documents to answer questions accurately; cite briefly when helpful. "
-    "Only propose scheduling after the caller asks for next steps, asks to speak to a person, or confirms they want an appointment. "
+    "Offer to schedule only after the caller asks for next steps, asks to speak to a person, or confirms they want an appointment. "
     "Before calling any tool, summarize the details you heard in ONE sentence and ask for a clear yes/no. "
     "If the caller changes topic mid-flow, gracefully pivot—do NOT repeat prior prompts. "
     "Never ask for the same field more than twice; if unclear, acknowledge and move on to clarify later."
@@ -252,12 +238,21 @@ TOOLS = [
 ]
 
 LANG_HINT_RE = re.compile(r"\b(espanol|español|spanish|ingl[eé]s|english)\b", re.I)
+YES_RE = re.compile(r"\b(yes|yeah|yep|ok|okay|sure|correct|that works|sounds good|sí|si|claro|de acuerdo|correcto)\b", re.I)
+SCHED_RE = re.compile(r"\b(book|schedule|appointment|set\s*up|consult|cita|agendar|programar)\b", re.I)
+
+
+def invites_booking(text: str, lang: str | None) -> bool:
+    if not text:
+        return False
+    t = text.lower()
+    if lang == "es-US":
+        return any(x in t for x in ["agendar", "cita", "programar", "agendemos", "agenda", "concertar"])
+    return any(x in t for x in ["schedule", "book", "set up", "appointment", "consultation"])
 
 async def send_text(ws: WebSocket, text: str):
-    # Twilio CR expects this JSON shape; see 64107 if you deviate.
     await ws.send_json({"type": "text", "token": text, "last": True})
 
-# Safely pull tool calls from a Responses object regardless of SDK minor changes.
 
 def extract_tool_calls(resp_obj) -> list[dict]:
     try:
@@ -265,12 +260,10 @@ def extract_tool_calls(resp_obj) -> list[dict]:
     except Exception:
         d = resp_obj
     calls = []
-    # Look through "output" list for items with "type":"tool_call"
     for item in (d.get("output") or []):
         if item.get("type") == "tool_call":
             tc = item.get("tool_call") or {}
             calls.append(tc)
-    # Some SDKs put tool calls under output[...].content[...]
     if not calls:
         for item in (d.get("output") or []):
             for c in (item.get("content") or []):
@@ -283,7 +276,6 @@ def output_text(resp_obj) -> str:
     try:
         return (resp_obj.output_text or "").strip()
     except Exception:
-        # Fallback: concatenate text content from output
         d = resp_obj if isinstance(resp_obj, dict) else getattr(resp_obj, "to_dict", lambda: {})()
         parts = []
         for item in (d.get("output") or []):
@@ -297,13 +289,15 @@ def output_text(resp_obj) -> str:
 async def relay(ws: WebSocket):
     await ws.accept()
     print("ConversationRelay: connected", flush=True)
-        # Running conversation state for this WS session
-    history: list[dict] = []
 
+    history: list[dict] = []  # running convo state per WS
+    caller_number: str | None = None
+    chosen_lang: str | None = None  # "en-US" or "es-US"
 
-    # Minimal local state (the model leads the dialog; we just switch language and execute tools)
-    caller_number = None
-    chosen_lang = None  # "en-US" or "es-US"
+    # tiny server-side guard
+    offered_booking = False
+    last_assistant_text = ""
+    last_user_text = ""
 
     try:
         while True:
@@ -319,8 +313,9 @@ async def relay(ws: WebSocket):
                 if not utter:
                     continue
                 print("RX:", utter, flush=True)
+                last_user_text = utter
 
-                # Language switch (local—also tell CR to use matching <Language>)
+                # Language switch (must match <Language> codes)
                 if LANG_HINT_RE.search(utter):
                     if re.search(r"espanol|español|spanish", utter, re.I):
                         chosen_lang = "es-US"
@@ -335,30 +330,22 @@ async def relay(ws: WebSocket):
 
                 system = SYSTEM_ES if chosen_lang == "es-US" else SYSTEM_EN
 
-                # Compose the Responses call
-                extra_body = {}
-                if VECTOR_STORE_ID:
-                    extra_body = {"attachments": [{"vector_store_id": VECTOR_STORE_ID}]}
-
+                # Build model call with running history
+                history.append({"role": "user", "content": utter})
                 try:
-                    # Append new user turn to history BEFORE calling the model
-                    history.append({"role": "user", "content": utter})
-
                     resp = client.responses.create(
                         model="gpt-4o-mini",
-                        input=[{"role": "system", "content": system}, *history[-20:]],  # keep last ~20 turns
+                        input=[{"role": "system", "content": system}, *history[-20:]],
                         tools=TOOLS,
                         max_output_tokens=220,
                         temperature=0.3,
                         extra_body=({"attachments": [{"vector_store_id": VECTOR_STORE_ID}]} if VECTOR_STORE_ID else None),
                     )
-
                 except Exception as e:
                     print("OpenAI error:", repr(e), flush=True)
                     await send_text(ws, "I’m having trouble right now. Could you please repeat?")
                     continue
 
-                # Execute tool calls if any
                 calls = extract_tool_calls(resp)
                 if calls:
                     for tc in calls:
@@ -367,16 +354,23 @@ async def relay(ws: WebSocket):
                             args = json.loads(tc.get("arguments") or "{}")
                         except Exception:
                             args = {}
-                        result = {}
+
+                        # ---- Booking guard: only allow if invited recently or explicit scheduling intent ----
                         if name == "book_appointment":
-                            # Ensure caller phone if missing
-                            if caller_number and not args.get("phone"):
-                                args["phone"] = caller_number
-                            try:
-                                out = save_booking(args)
-                                result = {"ok": True, "id": out["id"], "start": out["start"], "end": out["end"]}
-                            except Exception as e:
-                                result = {"ok": False, "error": f"booking_failed: {e}"}
+                            explicit_intent = bool(SCHED_RE.search(last_user_text))
+                            # allow if assistant invited OR user expressed scheduling OR model provided full datetime
+                            allow = offered_booking or explicit_intent or bool(args.get("iso_start"))
+                            if not allow:
+                                # Deny and nudge model to keep chatting/clarify
+                                result = {"ok": False, "error": "guard_blocked_need_booking_intent"}
+                            else:
+                                if caller_number and not args.get("phone"):
+                                    args["phone"] = caller_number
+                                try:
+                                    out = save_booking(args)
+                                    result = {"ok": True, "id": out["id"], "start": out["start"], "end": out["end"]}
+                                except Exception as e:
+                                    result = {"ok": False, "error": f"booking_failed: {e}"}
                         elif name == "mark_opt_out":
                             if caller_number and not args.get("phone"):
                                 args["phone"] = caller_number
@@ -388,55 +382,53 @@ async def relay(ws: WebSocket):
                         else:
                             result = {"ok": False, "error": f"unknown_tool: {name}"}
 
-                        # 1) Record the assistant's tool call in history so the model can follow up coherently
-                        tool_name = name
-                        tool_id = tc.get("id") or uuid.uuid4().hex  # tolerate missing id
-
+                        # Record tool call + result, then follow up with same history
+                        tool_id = tc.get("id") or uuid.uuid4().hex
                         history.append({
                             "role": "assistant",
                             "content": [{
                                 "type": "tool_call",
                                 "id": tool_id,
-                                "name": tool_name,
+                                "name": name,
                                 "arguments": json.dumps(args, ensure_ascii=False)
                             }]
                         })
-
-                        # 2) Record the tool result turn
                         history.append({
                             "role": "tool",
                             "content": json.dumps(result, ensure_ascii=False),
-                            "name": tool_name,
+                            "name": name,
                             "tool_call_id": tool_id
                         })
 
-                        # 3) Ask the model for the final confirmation/message with full history
                         follow = client.responses.create(
                             model="gpt-4o-mini",
                             input=[{"role":"system","content": system}, *history[-20:]],
                             max_output_tokens=160,
                             temperature=0.2,
-                            tools=TOOLS,  # keep tools attached in case the model wants to chain
+                            tools=TOOLS,
                             extra_body=({"attachments": [{"vector_store_id": VECTOR_STORE_ID}]} if VECTOR_STORE_ID else None),
                         )
                         final_text = output_text(follow) or "Done."
                         history.append({"role": "assistant", "content": final_text})
+                        last_assistant_text = final_text
+                        offered_booking = invites_booking(final_text, chosen_lang)
                         await send_text(ws, final_text)
-
                     continue
 
                 # No tools—send the model’s direct answer
                 text = output_text(resp) or "Sorry, could you say that again?"
                 history.append({"role": "assistant", "content": text})
+                last_assistant_text = text
+                offered_booking = invites_booking(text, chosen_lang)
                 await send_text(ws, text)
                 continue
 
             if mtype == "interrupt":
-                # Log and gently reset: add a brief assistant ack so the model understands we paused
                 cut = (msg.get("utteranceUntilInterrupt") or "").strip()
                 print("Interrupted:", cut, flush=True)
-                # Optional: mark in history for clarity (developer/meta role not always supported; use assistant)
                 history.append({"role": "assistant", "content": "Understood—go ahead."})
+                # reset any stale invite to avoid sticking
+                offered_booking = False
                 continue
 
             if mtype == "error":
