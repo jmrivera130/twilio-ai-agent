@@ -1,7 +1,7 @@
-# app.py — FastAPI + Twilio Conversation Relay + OpenAI (EN/ES, single number)
-# Minimal, surgical edits only: keep existing behavior; add lightweight language choice.
-# No TwiML attribute changes; voice stays as in your working file.
-# Adds: language state (en/es), Spanish prompts/flows mirroring booking + opt-out.
+# app.py — FastAPI + Twilio ConversationRelay (2025) + OpenAI
+# Phased flow: language → intro → Q&A → booking → outro, with recoverable slots and no loops.
+# Uses Twilio ConversationRelay 2025 features: reportInputDuringAgentSpeech, <Language> mapping, WS language message.
+# Keeps /voice tiny to avoid 11205 (hard 15s webhook cap).
 
 import os, re, json, uuid
 from datetime import datetime, date, time, timedelta
@@ -31,46 +31,28 @@ ICS_DIR.mkdir(parents=True, exist_ok=True)
 client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
 
+# ----------- Prompts -----------
 SYSTEM_PROMPT_EN = (
     "You are Chloe from Foreclosure Relief Group. Be warm, concise, and clear. "
     "Prefer 1–3 short sentences. Avoid filler. Offer more detail only if asked. "
-    "If the caller asks for help, offer to schedule a consultation."
+    "If the caller asks for help, offer to schedule a consultation. "
+    "When a slot is active (date/time/name/address/phone/confirm), respond briefly and return to that task."
 )
 SYSTEM_PROMPT_ES = (
     "Eres Chloe del Foreclosure Relief Group. Habla en español claro y breve. "
-    "Usa 1–3 frases cortas. Sin relleno. Ofrece detalles solo si te los piden. "
-    "Si la persona pide ayuda, ofrece agendar una consulta."
+    "Usa 1–3 frases cortas. Sin relleno. Da más detalles solo si te los piden. "
+    "Si la persona pide ayuda, ofrece agendar una consulta. "
+    "Cuando haya una tarea activa (fecha/hora/nombre/dirección/teléfono/confirmar), responde breve y vuelve a esa tarea."
 )
 
-# ---------- utils ----------
-async def send_text(ws: WebSocket, text: str):
-    s = (text or "").strip()
-    if not s:
-        return
-    chunks = []
-    buf = ""
-    for token in s.split():
-        if len(buf) + 1 + len(token) > 40:
-            if buf:
-                chunks.append(buf)
-            buf = token
-        else:
-            buf = token if not buf else buf + " " + token
-    if buf:
-        chunks.append(buf)
-    if not chunks:
-        chunks = [s]
-    for c in chunks[:-1]:
-        await ws.send_json({"type": "text", "token": c, "last": False})
-    await ws.send_json({"type": "text", "token": chunks[-1], "last": True})
+# ----------- helpers -----------
+async def send_text(ws: WebSocket, text: str, last: bool = True):
+    # Stream a single token (we send whole sentences here) to ConversationRelay for TTS.
+    await ws.send_json({"type": "text", "token": text, "last": last})
 
 async def set_cr_language(ws: WebSocket, tts: str, stt: str):
     # Twilio ConversationRelay WS message to switch TTS/STT mid-call
-    await ws.send_json({
-        "type": "language",
-        "ttsLanguage": tts,
-        "transcriptionLanguage": stt
-    })
+    await ws.send_json({"type": "language", "ttsLanguage": tts, "transcriptionLanguage": stt})
 
 def _day_path(d: date) -> Path:
     return BOOK_DIR / f"{d.isoformat()}.jsonl"
@@ -108,7 +90,7 @@ def save_booking(start_dt: datetime, caller_number: str | None,
         "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         "start": start_dt.isoformat(),
         "end": end_dt.isoformat(),
-        "caller": caller_number,
+        "caller": caller_number or "",
         "name": (name or "").strip(),
         "address": (address or "").strip(),
         "note": note,
@@ -116,7 +98,7 @@ def save_booking(start_dt: datetime, caller_number: str | None,
     }
     ics_text = make_ics(rec["id"], start_dt, end_dt,
                         "Foreclosure Relief Consultation",
-                        f"Caller: {caller_number or 'unknown'}; Name: {rec['name']}; Address: {rec['address']}")
+                        f"Caller: {rec['caller']}; Name: {rec['name']}; Address: {rec['address']}")
     (ICS_DIR / f"{rec['id']}.ics").write_text(ics_text, encoding="utf-8")
     _write_jsonl_for_day(start_dt.date(), rec)
     try:
@@ -134,7 +116,7 @@ def save_optout(caller_number: str | None, name: str | None, address: str | None
         "id": uuid.uuid4().hex[:12],
         "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         "start": "", "end": "",
-        "caller": caller_number,
+        "caller": caller_number or "",
         "name": (name or "").strip(),
         "address": (address or "").strip(),
         "note": note, "calendar_link": ""
@@ -238,9 +220,9 @@ def parse_time_phrase(text: str) -> time | None:
         return time(12, 0)
     if "midnight" in s or "medianoche" in s:
         return time(0, 0)
-    m = re.search(r"\b(?:at\s*|a\s*las\s*)?(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?|am|pm)?\b", s)
+    m = re.search(r"\b(?:at\s*|a\s*las\s*)?(\d{1,2})(?::(\d{2}))?(a\.??m\.??|p\.??m\.??|am|pm)?\b", s)
     if not m:
-        m = re.search(r"(?:^|[^0-9])(\d{1,2})(?::(\d{2}))?(a\.?m\.?|p\.?m\.?)?(?:$|[^0-9])", s2)
+        m = re.search(r"(?:^|[^0-9])(\d{1,2})(?::(\d{2}))?(a\.??m\.??|p\.??m\.??)?(?:$|[^0-9])", s2)
     if not m:
         return None
     hour = int(m.group(1)); minute = int(m.group(2) or 0); ap = (m.group(3) or "").replace(".", "")
@@ -268,7 +250,7 @@ YES_RE = re.compile(r"\b(yes|yeah|yep|correct|confirmed|that works|sounds good|o
 SCHEDULING_HINT_RE = re.compile(r"\b(schedule|book|appointment|set up|consult|cita|agendar|programar)\b", re.I)
 OPT_OUT_RE = re.compile(r"\b(opt\s*out|do\s*not\s*contact|do\s*not\s*call|don't\s*call|do not call|stop|unsubscribe|remove me|take me off|no me llames|no me contacten|quitar|baja)\b", re.I)
 
-NAME_RE = re.compile(r"\b(my name is|this is|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.\-\'\s]{1,60})\b", re.I)
+NAME_RE = re.compile(r"\b(my name is|this is|me llamo|mi nombre es)\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ\.\-'\s]{1,60})\b", re.I)
 ADDR_HINT_RE = re.compile(r"\b(address|property address|the address|la direccion|la dirección|la propiedad)\s*(?:is|es|:)?\s*(.+)", re.I)
 STREET_RE = re.compile(r"\b\d{1,6}\s+[A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ][A-Za-z0-9ÁÉÍÓÚÜÑáéíóúüñ\s\.\-']{3,}\b")
 PHONE_DIGITS = re.compile(r"\d")
@@ -278,7 +260,8 @@ MESSAGES = {
         "lang_choice": "Say 'English' or 'Español' to continue.",
         "lang_set": "Got it. I’ll continue in English.",
         "lang_set_es": "Entendido. Continuaré en español.",
-        "ask_date": "What day works for you? (e.g., Tuesday or September 15)",
+        "intro": "I’m Chloe with Foreclosure Relief Group. I can answer questions or help schedule a consultation.",
+        "ask_date": "What day works for you? (e.g., Tuesday or September 25)",
         "ask_time": "What time should I book? (e.g., 12 PM)",
         "ask_name": "Great — I have {when}. What’s your full name?",
         "ask_address": "Could you say the full property address, including the street and number?",
@@ -291,12 +274,14 @@ MESSAGES = {
         "opt_confirm": "Confirm do-not-contact for {name} at {addr}, phone {phone}. Is that correct?",
         "opt_done": "You’re marked do-not-contact. Anything else?",
         "please_yes_no": "Please say yes or no to confirm.",
+        "outro": "Thanks for calling. If you need anything else, just say so."
     },
     "es": {
         "lang_choice": "Di 'English' o 'Español' para continuar.",
         "lang_set": "Got it. I’ll continue in English.",
         "lang_set_es": "Entendido. Continuaré en español.",
-        "ask_date": "¿Qué día te funciona? (por ej., martes o 15 de septiembre)",
+        "intro": "Soy Chloe del Foreclosure Relief Group. Puedo responder preguntas o agendar una consulta.",
+        "ask_date": "¿Qué día te funciona? (por ej., martes o 25 de septiembre)",
         "ask_time": "¿A qué hora agendamos? (por ej., 12 PM)",
         "ask_name": "Perfecto — tengo {when}. ¿Cuál es tu nombre completo?",
         "ask_address": "¿Puedes decir la dirección completa de la propiedad (calle y número)?",
@@ -309,17 +294,49 @@ MESSAGES = {
         "opt_confirm": "Confirma no-contactar para {name} en {addr}, teléfono {phone}. ¿Correcto?",
         "opt_done": "Quedaste en no-contactar. ¿Algo más?",
         "please_yes_no": "Por favor di sí o no para confirmar.",
+        "outro": "Gracias por llamar. Si necesitas algo más, dímelo."
     }
 }
 
+class NameCollector:
+    """Interruption-aware name collector: accepts 'First Last' in one turn or binds First then tail.
+       Tracks simple repeats and allows 'yes' to confirm single-token names."""
+    def __init__(self):
+        self.first = None
+        self.repeats = 0
+
+    def need_tail(self):
+        return bool(self.first and not isinstance(self.first, list))
+
+    def observe(self, utter: str):
+        s = (utter or "").strip()
+        # full name fast path
+        m_full = re.search(r"\b([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][\w'\-]{1,})\s+([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][\w'\-]{1,})\b", s)
+        if m_full:
+            full = (m_full.group(1) + " " + m_full.group(2)).strip()
+            return True, full
+        # capture first token
+        m_first = re.search(r"\b([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][\w'\-]{1,})\b", s)
+        if m_first and not self.first:
+            self.first = m_first.group(1)
+            return False, None
+        # tail
+        if self.first:
+            m_last = re.search(r"\b([A-Za-zÁÉÍÓÚÜÑáéíóúüñ][\w'\-]{1,})\b", s)
+            if m_last and m_last.group(1).lower() != self.first.lower():
+                return True, f"{self.first} {m_last.group(1)}"
+            else:
+                self.repeats += 1
+        return False, None
+
 def maybe_extract_name(text: str) -> str | None:
-    m = NAME_RE.search(text)
+    m = NAME_RE.search(text or "")
     if m:
         return m.group(2).strip(" .,'-")
     return None
 
 def maybe_extract_address(text: str) -> str | None:
-    m = ADDR_HINT_RE.search(text)
+    m = ADDR_HINT_RE.search(text or "")
     if m:
         addr = m.group(1 if "address" in m.group(0).lower() else 2).strip()
         if STREET_RE.search(addr):
@@ -330,52 +347,8 @@ def maybe_extract_address(text: str) -> str | None:
     return None
 
 def is_full_street_address(text: str) -> bool:
-    return bool(text and STREET_RE.search(text.strip()))
+    return bool(text and STREET_RE.search((text or "").strip()))
 
-
-
-class NameCollector:
-    def __init__(self):
-        self.first = None
-        self.last = None
-        self.repeats = 0
-        self.last_input = ""
-
-    @staticmethod
-    def tokens(text: str):
-        s = (text or "").strip()
-        s = re.sub(r"[^\wÁÉÍÓÚÜÑáéíóúüñ'\-\s]", " ", s)
-        s = re.sub(r"\s+", " ", s).strip()
-        toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'\-]{0,60}", s)
-        return toks
-
-    def observe(self, text: str):
-        toks = self.tokens(text)
-        norm = " ".join(toks).lower()
-        if norm and norm == (self.last_input or "").lower():
-            self.repeats += 1
-        else:
-            self.repeats = 0
-        self.last_input = " ".join(toks)
-        if len(toks) >= 2:
-            self.first, self.last = toks[0], toks[1]
-            return True, f"{self.first} {self.last}"
-        if len(toks) == 1:
-            if not self.first:
-                self.first = toks[0]
-                return False, None
-            else:
-                self.last = toks[0]
-                return True, f"{self.first} {self.last}"
-        return False, None
-
-    def need_tail(self) -> bool:
-        return bool(self.first and not self.last)
-
-    def value(self):
-        if self.first and self.last:
-            return f"{self.first} {self.last}"
-        return None
 def maybe_extract_phone(text: str) -> str | None:
     digits = re.sub(r"\D+", "", text or "")
     if 10 <= len(digits) <= 15:
@@ -400,10 +373,10 @@ def when_phrase(dt: datetime, lang: str = "en") -> str:
     base = dt.strftime('%A, %B %d, %I:%M %p') if lang == 'en' else dt.strftime('%A %d de %B, %I:%M %p')
     return f"{base} {_tz_label(dt)}"
 
-# ---------- HTTP: Twilio hits /voice (unchanged TwiML except URL/voice come from your env/code) ----------
+# ---------- HTTP: Twilio hits /voice (tiny TwiML) ----------
 @app.post("/voice")
 async def voice(_: Request):
-    # Minimal, fast TwiML for ConversationRelay (no blocking, returns immediately)
+    # Minimal TwiML, immediate return (hard 15s Twilio limit for voice webhooks)
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Connect>
@@ -415,7 +388,6 @@ async def voice(_: Request):
       reportInputDuringAgentSpeech="speech"
       interruptible="any"
       hints="Foreclosure, Foreclosure Relief Group, consultation, address, appointment, cita, Español, English, John, Smith, Snow, Lopez">
-      <!-- Predeclare language mappings so runtime WS switches have concrete TTS/STT configs -->
       <Language code="en-US"
                 ttsProvider="Amazon"
                 voice="Joanna-Neural"
@@ -487,20 +459,23 @@ async def relay(ws: WebSocket):
 
     caller_number: str | None = None
     state = {
+        "phase": "language",  # language -> intro -> qna -> booking -> outro
         "lang": None,         # "en" or "es"
         "lang_prompted": False,
         "mode": None,         # None | "booking" | "optout"
         "need": None,         # None | "date" | "time" | "name" | "address" | "phone" | "confirm"
+        "capture_next": None, # None | "name" | "address" | "phone"
+        "name_collector": None,
+        "offered_booking": False,
+
         "hold_date": None,
         "hold_time": None,
         "hold_dt": None,
         "hold_name": None,
         "hold_address": None,
         "hold_phone": None,
-        "offered_booking": False,
-        "capture_next": None,
-        "name_collector": None,
-        "name_buffer": [],
+
+        "retries": 0,         # per-slot small counter
     }
 
     try:
@@ -516,51 +491,158 @@ async def relay(ws: WebSocket):
                 user_text = (msg.get("voicePrompt") or "").strip()
                 if not user_text:
                     continue
-                print("RX:", user_text, flush=True)
-                
-                # Active-need gate: satisfy pending field before any other logic
-                # ---------- active slot capture ----------
+                print(f"RX: {user_text} | phase={state['phase']} need={state['need']} cap={state['capture_next']}", flush=True)
+
+                # --- Language selection (single-number menu) ---
+                if not state["lang"]:
+                    s = user_text.lower()
+                    if re.search(r"\b(esp[aá]nol|spanish|2)\b", s):
+                        state["lang"] = "es"
+                        await set_cr_language(ws, "es-ES", "es-ES")
+                        await send_text(ws, MESSAGES["es"]["lang_set_es"])
+                        await send_text(ws, MESSAGES["es"]["intro"])
+                        state["offered_booking"] = True
+                        state["phase"] = "qna"
+                        continue
+                    if re.search(r"\b(english|ingl[eé]s|1)\b", s):
+                        state["lang"] = "en"
+                        await set_cr_language(ws, "en-US", "en-US")
+                        await send_text(ws, MESSAGES["en"]["lang_set"])
+                        await send_text(ws, MESSAGES["en"]["intro"])
+                        state["offered_booking"] = True
+                        state["phase"] = "qna"
+                        continue
+                    if not state["lang_prompted"]:
+                        state["lang_prompted"] = True
+                        await send_text(ws, MESSAGES["en"]["lang_choice"])
+                        continue
+                    # default
+                    state["lang"] = "en"
+                    await set_cr_language(ws, "en-US", "en-US")
+                    await send_text(ws, MESSAGES["en"]["intro"])
+                    state["offered_booking"] = True
+                    state["phase"] = "qna"
+                    continue
+
+                lang = state["lang"]
+                MSG = MESSAGES[lang]
+                sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT_ES
+
+                # --- Quick date clarification ---
+                if re.search(r"\b(what\s+(date|day)\s+is\s+that|which\s+day\s+is\s+that)\b|\b(qu[eé]\s+fecha|qu[eé]\s+d[ií]a)\b", user_text, re.I):
+                    if state.get("hold_dt"):
+                        await send_text(ws, when_phrase(state["hold_dt"], lang)); continue
+
+                # --- Opt-out anytime ---
+                if OPT_OUT_RE.search(user_text):
+                    state.update({"mode":"optout"})
+                    if not state["hold_name"]:
+                        state["need"] = "name"; state["capture_next"]="name"; state["name_collector"]=NameCollector()
+                        await send_text(ws, MSG["opt_start"]); continue
+                    if not state["hold_address"]:
+                        state["need"] = "address"; state["capture_next"]="address"
+                        await send_text(ws, MSG["opt_addr"]); continue
+                    if not caller_number and not state["hold_phone"]:
+                        state["need"] = "phone"; state["capture_next"]="phone"
+                        await send_text(ws, MSG["opt_phone"]); continue
+                    ph = state["hold_phone"] or caller_number
+                    state["need"] = "confirm"; await send_text(ws, MSG["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)); continue
+
+                # ---------- Booking trigger & slot-fill ----------
+                d, t, dt_comb = extract_datetime(user_text)
+                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
+                yes_after_offer = bool(YES_RE.search(user_text) and state.get("offered_booking"))
+                datetime_implies_booking = bool(d or t)
+
+                if state["mode"] is None and (booking_keyword or yes_after_offer or datetime_implies_booking):
+                    state["mode"] = "booking"
+
+                if state["mode"] == "booking":
+                    # Cache date/time as we hear them
+                    if d: state["hold_date"] = d
+                    if t: state["hold_time"] = t
+                    if state.get("hold_date") and state.get("hold_time"):
+                        state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
+
+                    # Ask for missing pieces in order
+                    if not state.get("hold_date"):
+                        state["need"] = "date"; state["retries"]=0
+                        await send_text(ws, MSG["ask_date"]); continue
+                    if not state.get("hold_time"):
+                        state["need"] = "time"; state["retries"]=0
+                        await send_text(ws, MSG["ask_time"]); continue
+                    if not state.get("hold_name"):
+                        if state.get("capture_next") != "name":
+                            state["capture_next"] = "name"; state["name_collector"] = NameCollector()
+                        state["need"] = "name"
+                        when_say = when_phrase(state["hold_dt"], lang) if state.get("hold_dt") else ""
+                        await send_text(ws, MSG["ask_name"].format(when=when_say)); continue
+                    if not state.get("hold_address"):
+                        state["need"] = "address"; state["capture_next"]="address"; state["retries"]=0
+                        await send_text(ws, MSG["ask_address"]); continue
+                    if not caller_number and not state.get("hold_phone"):
+                        state["need"] = "phone"; state["capture_next"]="phone"; state["retries"]=0
+                        await send_text(ws, MSG["ask_phone"]); continue
+
+                    # Confirm
+                    state["need"] = "confirm"
+                    when_say = when_phrase(state["hold_dt"], lang)
+                    await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say))
+                    continue
+
+                # ---------- Active slot capture (name/address/phone) ----------
                 if state.get("capture_next") in {"name", "address", "phone"}:
                     cap = state["capture_next"]
 
-                    # NAME (interruption-aware, two-turn)
+                    # NAME (interruption-aware)
                     if cap == "name":
                         if not state.get("name_collector"):
                             state["name_collector"] = NameCollector()
+
+                        # Accept "yes" to confirm first-only
                         if YES_RE.search(user_text) and state["name_collector"].need_tail():
                             first_only = state["name_collector"].first or ""
                             if first_only:
                                 state["hold_name"] = first_only
+                                print(f"CAPTURED name={state['hold_name']}", flush=True)
                                 state["capture_next"] = None
-                                state["need"] = "address"
-                                await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                                state["need"] = None
+                                await send_text(ws, MSG["ask_address"])
+                                state["capture_next"] = "address"
                                 continue
+
                         done, full = state["name_collector"].observe(user_text)
 
                         if done and full:
-                            # got "First Last"
                             state["hold_name"] = full
+                            print(f"CAPTURED name={state['hold_name']}", flush=True)
                             state["capture_next"] = None
-                            state["need"] = "address"
-                            await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
+                            state["need"] = None
+                            await send_text(ws, MSG["ask_address"])
+                            state["capture_next"] = "address"
                             continue
 
                         if state["name_collector"].need_tail():
-                            # we have First, bind for Last
                             await send_text(ws, "Got it — now say your last name.")
-                            state["capture_next"] = "name"   # keep binder active
+                            state["capture_next"] = "name"
                             continue
 
                         if state["name_collector"].repeats >= 2:
-                            # single token repeated — offer confirm
                             first_only = state["name_collector"].first or ""
                             await send_text(ws, f"I heard your name as {first_only}. If that is your full name, say yes; otherwise add your last name.")
                             state["capture_next"] = "name"
                             continue
 
-                        # fallback re-ask (rare)
-                        when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), state["lang"])
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_say))
+                        # fallback re-ask with small retry ceiling
+                        state["retries"] += 1
+                        if state["retries"] > 2:
+                            # soft reset to Q&A to avoid loops
+                            state["mode"] = None; state["need"]=None; state["capture_next"]=None
+                            await send_text(ws, "I might have misheard. How can I help, or would you like to try booking again?")
+                            state["phase"]="qna"
+                            continue
+                        when_say = when_phrase(state.get("hold_dt") or datetime.now(TZ), lang)
+                        await send_text(ws, MSG["ask_name"].format(when=when_say))
                         state["capture_next"] = "name"
                         continue
 
@@ -570,17 +652,22 @@ async def relay(ws: WebSocket):
                         if is_full_street_address(addr):
                             state["hold_address"] = addr
                             state["capture_next"] = None
-                            state["need"] = "phone" if (not caller_number and not state["hold_phone"]) else "confirm"
-                            if state["need"] == "phone":
-                                await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
+                            state["need"] = None
+                            if not caller_number and not state.get("hold_phone"):
+                                state["capture_next"] = "phone"
+                                await send_text(ws, MSG["ask_phone"])
                                 continue
-                            when_say = when_phrase(state["hold_dt"], state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
-                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
+                            # go to confirm
+                            state["mode"]="booking"; state["need"]="confirm"
+                            when_say = when_phrase(state["hold_dt"], lang) if state.get("hold_dt") else ""
+                            await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
-
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
-                        state["capture_next"] = "address"
+                        state["retries"] += 1
+                        if state["retries"] > 2:
+                            state["mode"]=None; state["need"]=None; state["capture_next"]=None
+                            await send_text(ws, "I may have misheard the address. We can come back to that—what questions do you have?")
+                            state["phase"]="qna"; continue
+                        await send_text(ws, MSG["ask_address"])
                         continue
 
                     # PHONE
@@ -590,244 +677,61 @@ async def relay(ws: WebSocket):
                             state["hold_phone"] = ph
                             state["capture_next"] = None
                             state["need"] = "confirm"
-                            when_say = when_phrase(state["hold_dt"], state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
-                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
+                            when_say = when_phrase(state["hold_dt"], lang) if state.get("hold_dt") else ""
+                            await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say))
                             continue
-
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
-                        state["capture_next"] = "phone"
+                        state["retries"] += 1
+                        if state["retries"] > 2:
+                            state["mode"]=None; state["need"]=None; state["capture_next"]=None
+                            await send_text(ws, "Let’s circle back on the number later. What else can I help with?")
+                            state["phase"]="qna"; continue
+                        await send_text(ws, MSG["ask_phone"])
                         continue
 
-                # Fallback: legacy need-gate (still helpful if capture_next not set)
-                # ---------- legacy slot fallback (address/phone only) ----------
-                if state.get("need") in {"address", "phone"}:
-                    need_now = state["need"]
-
-                    if need_now == "address":
-                        addr = (maybe_extract_address(user_text) or user_text).strip()
-                        if is_full_street_address(addr):
-                            state["hold_address"] = addr
-                            state["need"] = "phone" if (not caller_number and not state["hold_phone"]) else "confirm"
-                            if state["need"] == "phone":
-                                await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
-                                continue
-                            when_say = when_phrase(state["hold_dt"], state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
-                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
-                            continue
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
-                        continue
-
-                    if need_now == "phone":
-                        ph = maybe_extract_phone(user_text)
-                        if ph:
-                            state["hold_phone"] = ph
-                            state["need"] = "confirm"
-                            when_say = when_phrase(state["hold_dt"], state["lang"])
-                            await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
-                                name=state["hold_name"], addr=state["hold_address"], when=when_say))
-                            continue
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
-                        continue
-
-                # --- Language selection (single-number menu) ---
-                if not state["lang"]:
-                    s = user_text.lower()
-                    if re.search(r"\b(esp[aá]nol|spanish|2)\b", s):
-                        state["lang"] = "es"
-                        await set_cr_language(ws, "es-ES", "es-ES")
-                        await send_text(ws, MESSAGES["es"]["lang_set_es"])
-                        await send_text(ws, "Soy Chloe del Foreclosure Relief Group. Puedo responder preguntas o agendar una consulta. ¿En qué te ayudo?")
-                        state["offered_booking"] = True
-                        continue
-
-                    if re.search(r"\b(english|ingl[eé]s|1)\b", s):
-                        state["lang"] = "en"
-                        await set_cr_language(ws, "en-US", "en-US")
-                        await send_text(ws, MESSAGES["en"]["lang_set"])
-                        await send_text(ws, "I’m Chloe with Foreclosure Relief Group. I can answer questions or help schedule a consultation. How can I help?")
-                        state["offered_booking"] = True
-                        continue
-
-                    if not state["lang_prompted"]:
-                        state["lang_prompted"] = True
-                        await send_text(ws, MESSAGES["en"]["lang_choice"]) 
-                        continue
-                    # If still unknown after prompt, default to English
-                    state["lang"] = "en"
-                    await set_cr_language(ws, "en-US", "en-US")
-                # ---------- booking trigger & slot fill (restores mode="booking") ----------
-                # Parse date/time from the user's message and decide whether to enter booking.
-                d, t, dt_comb = extract_datetime(user_text)
-                booking_keyword = bool(BOOKING_KEYWORDS_RE.search(user_text))
-                yes_after_offer = bool(YES_RE.search(user_text) and state.get("offered_booking"))
-                datetime_implies_booking = bool(d or t)
-
-                # If the user hinted at scheduling or gave date/time, start/continue booking
-                if state["mode"] is None and (booking_keyword or yes_after_offer or datetime_implies_booking):
-                    state["mode"] = "booking"
-
-                # If we are in booking mode, incrementally fill slots
-                if state["mode"] == "booking":
-                    # Cache date/time as we hear them
-                    if d:
-                        state["hold_date"] = d
-                    if t:
-                        state["hold_time"] = t
-                    if state["hold_date"] and state["hold_time"]:
-                        state["hold_dt"] = datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ)
-
-                    # Ask for missing pieces, in order: date -> time -> name -> address -> phone -> confirm
-                    if not state.get("hold_date"):
-                        state["need"] = "date"
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_date"])
-                        continue
-
-                    if not state.get("hold_time"):
-                        state["need"] = "time"
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_time"])
-                        continue
-
-                    # Name capture: (re)arm the interruption-aware collector only once
-                    if not state.get("hold_name"):
-                        if state.get("capture_next") != "name":
-                            state["capture_next"] = "name"
-                            state["name_collector"] = NameCollector()
-                        state["need"] = "name"
-                        when_say = when_phrase(state["hold_dt"], state["lang"])
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_name"].format(when=when_say))
-                        continue
-
-                    if not state.get("hold_address"):
-                        state["need"] = "address"
-                        state["capture_next"] = "address"
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_address"])
-                        continue
-
-                    if not caller_number and not state.get("hold_phone"):
-                        state["need"] = "phone"
-                        state["capture_next"] = "phone"
-                        await send_text(ws, MESSAGES[state["lang"]]["ask_phone"])
-                        continue
-
-                    # Have everything -> confirm
-                    state["need"] = "confirm"
-                    when_say = when_phrase(state["hold_dt"], state["lang"])
-                    await send_text(ws, MESSAGES[state["lang"]]["confirm_booking"].format(
-                        name=state["hold_name"], addr=state["hold_address"], when=when_say))
-                    continue
-
-                lang = state["lang"]
-                MSG = MESSAGES[lang]
-                sys_prompt = SYSTEM_PROMPT_EN if lang == "en" else SYSTEM_PROMPT_ES
-
-                # --- Quick date clarification ---
-                if re.search(r"\b(what\s+(date|day)\s+is\s+that|which\s+day\s+is\s+that)\b|\b(qué\s+d[ií]a|qu[eé]\s+fecha)\b", user_text, re.I):
-                    if state.get("hold_dt"):
-                        await send_text(ws, when_phrase(state["hold_dt"], lang)); continue
-
-                # --- Opt-out anytime ---
-                if OPT_OUT_RE.search(user_text):
-                    state.update({"mode":"optout"})
-                    if not state["hold_name"]:
-                        state["need"] = "name"
-                        state["capture_next"] = "name"
-                        state["name_collector"] = NameCollector()
-                        when_say = when_phrase(state["hold_dt"], lang)
-                        await send_text(ws, MSG["ask_name"].format(when=when_say))
-                        continue
-                    if not state["hold_address"]:
-                        state["need"] = "address"; state["capture_next"] = "address"; await send_text(ws, MSG["ask_address"]); continue
-                    if not caller_number and not state["hold_phone"]:
-                        state["need"] = "phone"; state["capture_next"] = "phone"; await send_text(ws, MSG["ask_phone"]); continue
-                    state["need"] = "confirm"; when_say = when_phrase(state["hold_dt"], lang)
-                    await send_text(ws, MSG["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say)); continue
-
-                if state["mode"] == "optout":
-                    if state["need"] == "name":
-                        nm = user_text.strip()
-                        if len(nm) < 2: await send_text(ws, MSG["ask_name"].format(when="")); continue
-                        state["hold_name"] = nm; state["need"] = "address"; await send_text(ws, MSG["opt_addr"]); continue
-                    if state["need"] == "address":
-                        addr = user_text.strip()
-                        if not is_full_street_address(addr): await send_text(ws, MSG["opt_addr"]); continue
-                        state["hold_address"] = addr
-                        if not caller_number and not state["hold_phone"]:
-                            state["need"] = "phone"; await send_text(ws, MSG["opt_phone"]); continue
-                        ph = state["hold_phone"] or caller_number
-                        state["need"] = "confirm"; await send_text(ws, MSG["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)); continue
-                    if state["need"] == "phone":
-                        ph = maybe_extract_phone(user_text)
-                        if not ph: await send_text(ws, MSG["opt_phone"]); continue
-                        state["hold_phone"] = ph
-                        state["need"] = "confirm"; await send_text(ws, MSG["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)); continue
-                    if state["need"] == "confirm":
-                        if YES_RE.search(user_text):
-                            ph = state["hold_phone"] or caller_number
-                            save_optout(ph, state["hold_name"], state["hold_address"])
-                            await send_text(ws, MSG["opt_done"])
-                            state.update({"mode":None, "need":None, "hold_date":None, "hold_time":None, "hold_dt":None, "hold_name":None, "hold_address":None, "hold_phone":None})
-                            continue
-                        await send_text(ws, MSG["please_yes_no"]); continue
-
-                if state["mode"] == "booking" and state["need"] == "confirm":
+                # ---------- Confirm stages ----------
+                if state["mode"] == "booking" and state.get("need") == "confirm":
                     if YES_RE.search(user_text):
-                        start_dt = state["hold_dt"]
-                        phone_used = state["hold_phone"] or caller_number
+                        start_dt = state["hold_dt"] or (datetime.now(TZ) + timedelta(days=1, hours=1))
+                        phone_used = state["hold_phone"] or caller_number or ""
                         rec = save_booking(start_dt, phone_used, state["hold_name"], state["hold_address"])
                         when_say = when_phrase(start_dt, lang)
                         await send_text(ws, MSG["booked"].format(when=when_say))
-                        state.update({"mode":None, "need":None, "hold_date":None, "hold_time":None, "hold_dt":None, "hold_name":None, "hold_address":None, "hold_phone":None})
+                        # outro and reset
+                        await send_text(ws, MSG["outro"])
+                        state.update({"phase":"outro","mode":None,"need":None,"capture_next":None,
+                                      "hold_date":None,"hold_time":None,"hold_dt":None,"hold_name":None,"hold_address":None,"hold_phone":None})
                         continue
                     await send_text(ws, MSG["please_yes_no"]); continue
 
-                # Hard gate: if guided flow is active, skip model fallthrough entirely
-                if state["mode"] in {"booking", "optout"} or state["need"] is not None:
-                    if state["mode"] == "booking":
-                        if not state["hold_name"]:
-                            state["need"] = "name"
-                            state["capture_next"] = "name"
-                            state["name_collector"] = NameCollector()
-                            when_say = when_phrase(state["hold_dt"], lang)
-                            await send_text(ws, MSG["ask_name"].format(when=when_say))
-                            continue
-
-                        if not state["hold_address"]:
-                            await send_text(ws, MESSAGES[lang]["ask_address"]) ; continue
-                        if not caller_number and not state["hold_phone"]:
-                            await send_text(ws, MESSAGES[lang]["ask_phone"]) ; continue
-                        when_say = when_phrase(datetime.combine(state["hold_date"], state["hold_time"], tzinfo=TZ), lang)
-                        await send_text(ws, MESSAGES[lang]["confirm_booking"].format(name=state["hold_name"], addr=state["hold_address"], when=when_say)) ; state["need"] = "confirm" ; continue
-                    if state["mode"] == "optout":
-                        if not state["hold_name"]:
-                            await send_text(ws, MESSAGES[lang]["opt_start"]) ; continue
-                        if not state["hold_address"]:
-                            await send_text(ws, MESSAGES[lang]["opt_addr"]) ; continue
-                        if not caller_number and not state["hold_phone"]:
-                            await send_text(ws, MESSAGES[lang]["opt_phone"]) ; continue
+                if state["mode"] == "optout" and state.get("need") == "confirm":
+                    if YES_RE.search(user_text):
                         ph = state["hold_phone"] or caller_number
-                        await send_text(ws, MESSAGES[lang]["opt_confirm"].format(name=state["hold_name"], addr=state["hold_address"], phone=ph)) ; state["need"] = "confirm" ; continue
+                        save_optout(ph, state["hold_name"], state["hold_address"])
+                        await send_text(ws, MSG["opt_done"])
+                        await send_text(ws, MSG["outro"])
+                        state.update({"phase":"outro","mode":None,"need":None,"capture_next":None,
+                                      "hold_date":None,"hold_time":None,"hold_dt":None,"hold_name":None,"hold_address":None,"hold_phone":None})
+                        continue
+                    await send_text(ws, MSG["please_yes_no"]); continue
 
-                # Normal chat fallthrough (language-aware)
+                # ---------- Normal Q&A fallthrough (nuance) ----------
                 try:
                     resp = client.responses.create(
                         model="gpt-4o-mini",
                         input=[
-                            {"role":"system","content": (SYSTEM_PROMPT_EN if lang=='en' else SYSTEM_PROMPT_ES)},
+                            {"role":"system","content": sys_prompt},
                             *history[-6:],
                             {"role":"user","content": user_text},
                         ],
                         max_output_tokens=180,
                         temperature=0.3,
                     )
-                    ai_text = (resp.output_text or "").strip() or ("Sorry, could you repeat that?" if lang=='en' else "¿Podrías repetir, por favor?")
+                    ai_text = (resp.output_text or "").strip() or ( "Sorry, could you repeat that?" if lang=='en' else "¿Podrías repetir, por favor?" )
                 except Exception as e:
                     print("OpenAI error:", repr(e), flush=True)
                     ai_text = "I’m having trouble right now. Please say that again." if lang=='en' else "Tengo un problema ahora. Por favor, repite."
 
                 print("TX:", ai_text, flush=True)
-                print(f"FLOW(after): mode={state['mode']} need={state['need']}", flush=True)
                 history.append({"role": "user", "content": user_text})
                 history.append({"role": "assistant", "content": ai_text})
                 await send_text(ws, ai_text)
@@ -835,8 +739,9 @@ async def relay(ws: WebSocket):
 
             if mtype == "interrupt":
                 print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                if state.get("need") == "name":
-                    state["capture_next"] = "name"
+                # keep binder for current slot
+                if state.get("need") in {"name","address","phone"}:
+                    state["capture_next"] = state["need"]
                 continue
 
             if mtype == "error":
@@ -845,11 +750,3 @@ async def relay(ws: WebSocket):
 
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
-
-
-def _name_tokens(s: str):
-    s = (s or "").strip()
-    s = re.sub(r"[^\wÁÉÍÓÚÜÑáéíóúüñ'\-\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    toks = re.findall(r"[A-Za-zÁÉÍÓÚÜÑáéíóúüñ][A-Za-zÁÉÍÓÚÜÑáéíóúüñ'\-]{0,60}", s)
-    return [t for t in toks if len(t) >= 2]
