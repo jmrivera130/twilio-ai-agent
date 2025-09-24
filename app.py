@@ -154,7 +154,7 @@ async def voice(_: Request):
       url=\"{RELAY_WSS_URL}\"
       transcriptionProvider=\"Deepgram\"
       speechModel=\"nova-3-general\"
-      ttsProvider=\"Amazon\">
+      ttsProvider=\"Amazon\"> 
       <Language code=\"en-US\" voice=\"Joanna-Neural\" />
       <Language code=\"es-US\" voice=\"Lupe-Neural\" />
     </ConversationRelay>
@@ -347,14 +347,13 @@ async def relay(ws: WebSocket):
                 history.append({"role": "user", "content": user_text})
                 try:
                     response = client.responses.create(
-                        model="gpt-4o-mini",  # or your chosen model
+                        model="gpt-4o-mini",
                         input=[
-                            {"role": "system", "content": SYSTEM_PROMPT}, 
-                            *history[-8:], 
-                            {"role": "user", "content": user_text},
+                            {"role": "system", "content": system},
+                            *history[-8:],
                         ],
-                        tools=[{"type": "file_search"}],
-                        tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}},
+                        tools=TOOLS,
+                        tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}} if VECTOR_STORE_ID else None,
                         max_output_tokens=220,
                         temperature=0.3,
                     )
@@ -364,7 +363,8 @@ async def relay(ws: WebSocket):
                     await send_text(ws, "Sorry, I had a problem—could you say that again?")
                     continue
 
-                tool_calls = extract_tool_calls(resp)
+                # Process tool calls first (if any)
+                tool_calls = extract_tool_calls(response)
                 if tool_calls:
                     for tc in tool_calls:
                         name = (tc.get("name") or "").strip()
@@ -422,10 +422,8 @@ async def relay(ws: WebSocket):
                         follow = client.responses.create(
                             model="gpt-4o-mini",
                             input=[{"role":"system","content": system}, *history[-24:]],
-                            tools=[{"type": "file_search"}, *TOOLS]  # include file_search plus your custom tools
-                                if isinstance(TOOLS, list) else [{"type":"file_search"}],
-                            tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}}
-                                if VECTOR_STORE_ID else None,
+                            tools=TOOLS,
+                            tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}} if VECTOR_STORE_ID else None,
                             max_output_tokens=180,
                             temperature=0.2,
                         )
@@ -441,7 +439,7 @@ async def relay(ws: WebSocket):
                     continue
 
                 # No tools — send the model’s direct answer
-                text = output_text(resp) or "Could you say that again?"
+                text = output_text(response) or "Could you say that again?"
                 history.append({"role": "assistant", "content": text})
 
                 # Update invite tracking based on THIS assistant turn
