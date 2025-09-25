@@ -1,10 +1,9 @@
 # app.py — Twilio ConversationRelay ↔ OpenAI Responses (Sept 2025)
-# Modern, non-primitive flow:
-#   • CR handles PSTN + STT/TTS (Deepgram nova-3); we send/receive JSON over WS.
-#   • OpenAI Responses w/ file_search + two tools (book_appointment, mark_opt_out).
-#   • Conversation state is threaded via a running messages history (no hand-written phases).
-#   • Strict booking guard prevents accidental booking loops on bare “yes/ok/yeah”.
-#   • EN/ES with <Language> blocks + mid-call switch; language persists for the session.
+# Modern, stable flow:
+#   • CR handles PSTN + STT/TTS (Deepgram nova-3); JSON over WS.
+#   • OpenAI Responses w/ file_search + tools (book_appointment, mark_opt_out).
+#   • Threaded history (no hand-written phases). Strict booking guard prevents "bare yes" loops.
+#   • EN/ES via <Language> blocks + mid-call switch; language persists per session.
 #   • CSV/ICS written only after a successful tool call.
 #
 # Requirements (Render):
@@ -32,7 +31,7 @@ RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ    = os.environ.get("TIMEZONE", "America/Los_Angeles")
 VECTOR_STORE_ID= os.environ.get("VECTOR_STORE_ID", "")
 ORG_NAME       = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
-APP_VERSION = os.environ.get("APP_VERSION", "local")
+APP_VERSION    = os.environ.get("APP_VERSION", "local")
 print(f"APP_VERSION={APP_VERSION}  RELAY_WSS_URL={RELAY_WSS_URL}  TZ={BUSINESS_TZ}", flush=True)
 TZ = ZoneInfo(BUSINESS_TZ)
 
@@ -193,7 +192,7 @@ async def report_day(day: str):
         headers={"Content-Disposition": f"attachment; filename=\"{fname}\""})
 
 # ---------- OpenAI glue ----------
-SYSTEM_EN = (
+SYSTEM_PROMPT_EN = (
     "You are Chloe from " + ORG_NAME + ". Be warm and concise (≤2 short sentences). "
     "Keep the entire call in the caller’s chosen language (English or Spanish). "
     "Use file_search on the attached documents to answer questions accurately; cite briefly when helpful. "
@@ -203,7 +202,7 @@ SYSTEM_EN = (
     "Never ask for the same field more than twice; if unclear, acknowledge and move on to clarify later."
 )
 
-SYSTEM_ES = (
+SYSTEM_PROMPT_ES = (
     "Eres Chloe de " + ORG_NAME + ". Sé cálida y concisa (≤2 frases). "
     "Mantén toda la llamada en el idioma elegido (inglés o español). "
     "Usa file_search en los documentos adjuntos para responder con precisión; incluye una cita breve cuando ayude. "
@@ -212,6 +211,11 @@ SYSTEM_ES = (
     "Si la persona cambia de tema, cambia con naturalidad—NO repitas solicitudes previas. "
     "Nunca pidas el mismo dato más de dos veces; si no está claro, reconoce y avanza para aclararlo luego."
 )
+
+
+def system_prompt_for(lang: str | None) -> str:
+    lang = (lang or "en").lower()
+    return SYSTEM_PROMPT_ES if lang.startswith("es") else SYSTEM_PROMPT_EN
 
 TOOLS = [
     {"type": "file_search"},
@@ -341,7 +345,7 @@ async def relay(ws: WebSocket):
                         offered_booking = False; offered_token_id = None
                         continue
 
-                system = SYSTEM_ES if chosen_lang == "es-US" else SYSTEM_EN
+                sys_text = system_prompt_for(chosen_lang)
 
                 # Append user to history and call the model with running context
                 history.append({"role": "user", "content": user_text})
@@ -349,7 +353,7 @@ async def relay(ws: WebSocket):
                     response = client.responses.create(
                         model="gpt-4o-mini",
                         input=[
-                            {"role": "system", "content": system},
+                            {"role": "system", "content": sys_text},
                             *history[-8:],
                         ],
                         tools=TOOLS,
@@ -421,7 +425,7 @@ async def relay(ws: WebSocket):
 
                         follow = client.responses.create(
                             model="gpt-4o-mini",
-                            input=[{"role":"system","content": system}, *history[-24:]],
+                            input=[{"role":"system","content": sys_text}, *history[-24:]],
                             tools=TOOLS,
                             tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}} if VECTOR_STORE_ID else None,
                             max_output_tokens=180,
