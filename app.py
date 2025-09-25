@@ -212,6 +212,10 @@ SYSTEM_PROMPT_ES = (
     "Nunca pidas el mismo dato más de dos veces; si no está claro, reconoce y avanza para aclararlo luego."
 )
 
+# Safety alias for any legacy references
+SYSTEM_PROMPT = SYSTEM_PROMPT_EN
+
+
 
 def system_prompt_for(lang: str | None) -> str:
     lang = (lang or "en").lower()
