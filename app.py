@@ -1,4 +1,3 @@
-
 from pathlib import Path
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -33,7 +32,7 @@ SYSTEM_PROMPT_EN = (
     "You are Chloe from Foreclosure Relief Group, a concise, friendly voice assistant. "
     "Speak in short sentences (1-3). Be patient; ask for clarification gently. "
     "Stay in English. If the caller asks 'what is this about', briefly explain services. "
-    "When and only when the caller clearly wants to book, call the tool 'book_appointment'. "
+    "Only when the caller clearly wants to book, call the tool 'book_appointment'. "
     "If they ask to be removed or say do not call, call the tool 'mark_opt_out'. "
     "Confirm details once before saving. Never loop; if uncertain, rephrase or move on."
 )
@@ -176,6 +175,7 @@ async def report_today():
 
 # ---------- CR <-> OpenAI Realtime bridge (text modality) ----------
 async def send_text(ws: WebSocket, token: str, last: bool):
+    # Only send Twilio-CR-compliant shapes
     await ws.send_json({"type": "text", "token": token, "last": last})
 
 TOOLS_SPEC = [
@@ -216,101 +216,103 @@ async def relay(ws: WebSocket):
     print("ConversationRelay: connected", flush=True)
     caller_number = None
     lang = "en"
-    rt = None
 
     try:
-        rt = client.realtime.connect(model="gpt-realtime")
-        await rt.__aenter__()
-        instructions = system_prompt_for(lang)
-        await rt.session.update(session={
-            "modalities": ["text"],
-            "instructions": instructions,
-            "tools": TOOLS_SPEC
-        })
+        # --- Open one OpenAI Realtime session and keep the ENTIRE loop inside ---
+        async with client.realtime.connect(
+            model="gpt-4o-realtime"
+        ) as rt:
 
-        while True:
-            msg = await ws.receive_json()
-            mtype = msg.get("type")
+            # Initialize session once
+            instructions = system_prompt_for(lang)
+            await rt.session.update(session={
+                "modalities": ["text"],
+                "instructions": instructions,
+                "tools": TOOLS_SPEC
+            })
 
-            if mtype == "setup":
-                caller_number = (msg.get("from") or "").strip() or None
-                continue
+            # Main CR <-> OpenAI loop
+            while True:
+                msg = await ws.receive_json()
+                mtype = msg.get("type")
 
-            if mtype == "language":
-                code = (msg.get("language") or "").lower()
-                lang = "es" if code.startswith("es") else "en"
-                instructions = system_prompt_for(lang)
-                await rt.session.update(session={"instructions": instructions})
-                continue
-
-            if mtype == "prompt":
-                user_text = (msg.get("voicePrompt") or "").strip()
-                if not user_text:
+                if mtype == "setup":
+                    caller_number = (msg.get("from") or "").strip() or None
                     continue
 
-                await rt.conversation.item.create(item={
-                    "type": "message",
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": user_text}]
-                })
-                await rt.response.create()
+                if mtype == "language":
+                    code = (msg.get("language") or "").lower()
+                    lang = "es" if code.startswith("es") else "en"
+                    instructions = system_prompt_for(lang)
+                    await rt.session.update(session={"instructions": instructions})
+                    continue
 
-                async for event in rt.stream():
-                    et = event.get("type")
-                    if et == "response.text.delta":
-                        await send_text(ws, event.get("delta") or "", False)
-                    elif et == "response.text.done":
-                        await send_text(ws, "", True)
-                    elif et in ("response.error", "error"):
-                        print("Realtime error:", event, flush=True)
-                        break
-                    elif et == "response.function.call":
-                        fn = event.get("name")
-                        args = event.get("arguments") or {}
-                        tool_id = event.get("tool_call_id") or event.get("id") or uuid.uuid4().hex
+                if mtype == "prompt":
+                    user_text = (msg.get("voicePrompt") or "").strip()
+                    if not user_text:
+                        continue
 
-                        try:
-                            if fn == "book_appointment":
-                                rec = save_booking(
-                                    start_iso=args.get("iso_start"),
-                                    name=args.get("name"),
-                                    address=args.get("address"),
-                                    caller=caller_number,
-                                    duration_min=int(args.get("duration_min") or 30)
-                                )
-                                result = {"ok": True, "id": rec["id"], "ics_url": f"/ics/{rec['id']}.ics"}
-                            elif fn == "mark_opt_out":
-                                rec = save_optout(
-                                    name=args.get("name"),
-                                    address=args.get("address"),
-                                    phone=caller_number or args.get("phone")
-                                )
-                                result = {"ok": True, "id": rec["id"]}
-                            else:
-                                result = {"ok": False, "error": f"Unknown tool {fn}"}
-                        except Exception as e:
-                            result = {"ok": False, "error": repr(e)}
+                    # Send the user's message to the model
+                    await rt.conversation.item.create(item={
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": user_text}]
+                    })
+                    await rt.response.create()
 
-                        await rt.response.create(
-                            response={"type": "tool_result", "tool_call_id": tool_id, "output": result}
-                        )
-                    elif et in ("response.completed", "response.finish"):
-                        break
-                continue
+                    # Stream model output back to Twilio
+                    async for event in rt.stream():
+                        et = event.get("type")
+                        if et == "response.text.delta":
+                            await send_text(ws, event.get("delta") or "", False)
+                        elif et == "response.text.done":
+                            await send_text(ws, "", True)
+                        elif et in ("response.error", "error"):
+                            # Log errors server-side only; don't send to CR
+                            print("Realtime error:", event, flush=True)
+                            break
+                        elif et == "response.function.call":
+                            fn = event.get("name")
+                            args = event.get("arguments") or {}
+                            tool_id = event.get("tool_call_id") or event.get("id") or uuid.uuid4().hex
 
-            if mtype == "interrupt":
-                print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                continue
+                            try:
+                                if fn == "book_appointment":
+                                    rec = save_booking(
+                                        start_iso=args.get("iso_start"),
+                                        name=args.get("name"),
+                                        address=args.get("address"),
+                                        caller=caller_number,
+                                        duration_min=int(args.get("duration_min") or 30)
+                                    )
+                                    result = {"ok": True, "id": rec["id"], "ics_url": f"/ics/{rec['id']}.ics"}
+                                elif fn == "mark_opt_out":
+                                    rec = save_optout(
+                                        name=args.get("name"),
+                                        address=args.get("address"),
+                                        phone=caller_number or args.get("phone")
+                                    )
+                                    result = {"ok": True, "id": rec["id"]}
+                                else:
+                                    result = {"ok": False, "error": f"Unknown tool {fn}"}
+                            except Exception as e:
+                                result = {"ok": False, "error": repr(e)}
 
-            if mtype == "error":
-                print("CR error:", msg.get("description"), flush=True)
-                continue
+                            await rt.response.create(
+                                response={"type": "tool_result", "tool_call_id": tool_id, "output": result}
+                            )
+                        elif et in ("response.completed", "response.finish"):
+                            break
+                    continue
+
+                if mtype == "interrupt":
+                    print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
+                    # Let the model handle turn-taking; no special shape sent to CR
+                    continue
+
+                if mtype == "error":
+                    print("CR error:", msg.get("description"), flush=True)
+                    continue
 
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
-    finally:
-        if rt is not None:
-            try:
-                await rt.__aexit__(None, None, None)
-            except Exception:
-                pass
