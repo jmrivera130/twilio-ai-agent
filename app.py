@@ -8,6 +8,8 @@ from fastapi.responses import PlainTextResponse, JSONResponse
 
 from openai import OpenAI
 
+print("=== NEW BUILD LOADED ===", flush=True)
+
 # ---------- Env & constants ----------
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
 if not OPENAI_API_KEY:
