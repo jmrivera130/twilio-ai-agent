@@ -1,143 +1,178 @@
+# app.py — Twilio ConversationRelay ↔ OpenAI Responses (Sept 2025)
+# Modern, non-primitive flow:
+#   • CR handles PSTN + STT/TTS (Deepgram nova-3); we send/receive JSON over WS.
+#   • OpenAI Responses w/ file_search + two tools (book_appointment, mark_opt_out).
+#   • Conversation state is threaded via a running messages history (no hand-written phases).
+#   • Strict booking guard prevents accidental booking loops on bare “yes/ok/yeah”.
+#   • EN/ES with <Language> blocks + mid-call switch; language persists for the session.
+#   • CSV/ICS written only after a successful tool call.
+#
+# Requirements (Render):
+#   pip install "openai>=1.52.0" fastapi uvicorn
+# Env Vars:
+#   OPENAI_API_KEY
+#   RELAY_WSS_URL = wss://<your-app>.onrender.com/relay
+#   TIMEZONE = America/Los_Angeles
+#   VECTOR_STORE_ID = vs_... (optional, for your PDFs)
+#   ORG_NAME = Foreclosure Relief Group
+
+from __future__ import annotations
+import os, json, uuid, re
+from datetime import datetime, timedelta, date
 from pathlib import Path
-from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
-import os, json, uuid
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request, Response
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Request
+from fastapi.responses import PlainTextResponse, JSONResponse, Response
+from openai import AsyncOpenAI
 
-from openai import OpenAI
-
-print("=== NEW BUILD LOADED ===", flush=True)
-
-# ---------- Env & constants ----------
-OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "")
-if not OPENAI_API_KEY:
-    print("WARNING: OPENAI_API_KEY not set", flush=True)
-
-RELAY_WSS_URL = os.environ.get("RELAY_WSS_URL", "wss://YOUR-APP.onrender.com/relay")
-BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
+# ---------- ENV ----------
+OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+RELAY_WSS_URL  = os.environ["RELAY_WSS_URL"]
+BUSINESS_TZ    = os.environ.get("TIMEZONE", "America/Los_Angeles")
+VECTOR_STORE_ID= os.environ.get("VECTOR_STORE_ID", "")
+ORG_NAME       = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
+APP_VERSION = os.environ.get("APP_VERSION", "local")
+print(f"APP_VERSION={APP_VERSION}  RELAY_WSS_URL={RELAY_WSS_URL}  TZ={BUSINESS_TZ}", flush=True)
 TZ = ZoneInfo(BUSINESS_TZ)
 
-# Storage
-BOOK_DIR = Path(os.environ.get("BOOK_DIR", "/tmp/appointments"))
-ICS_DIR = Path(os.environ.get("ICS_DIR", "/tmp/ics"))
-REPORT_DIR = Path(os.environ.get("REPORT_DIR", "/tmp/reports"))
-for p in [BOOK_DIR, ICS_DIR, REPORT_DIR]:
-    p.mkdir(parents=True, exist_ok=True)
+# ---------- Storage ----------
+BASE_DIR   = Path(os.environ.get("DATA_DIR", "/tmp"))
+BOOK_DIR   = BASE_DIR / "appointments"; BOOK_DIR.mkdir(parents=True, exist_ok=True)
+ICS_DIR    = BASE_DIR / "ics";          ICS_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR = BASE_DIR / "reports";      REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-client = OpenAI(api_key=OPENAI_API_KEY)
 app = FastAPI()
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
 
-# System prompts
-SYSTEM_PROMPT_EN = (
-    "You are Chloe from Foreclosure Relief Group, a concise, friendly voice assistant. "
-    "Speak in short sentences (1-3). Be patient; ask for clarification gently. "
-    "Stay in English. If the caller asks 'what is this about', briefly explain services. "
-    "Only when the caller clearly wants to book, call the tool 'book_appointment'. "
-    "If they ask to be removed or say do not call, call the tool 'mark_opt_out'. "
-    "Confirm details once before saving. Never loop; if uncertain, rephrase or move on."
-)
-SYSTEM_PROMPT_ES = (
-    "Eres Chloe del Foreclosure Relief Group. Habla en español claro (1–3 frases). "
-    "Mantente en español. Si preguntan '¿de qué se trata?', explica brevemente. "
-    "Solo cuando la persona quiera agendar, llama a la herramienta 'book_appointment'. "
-    "Si pide no ser contactada, llama a 'mark_opt_out'. Confirma una vez antes de guardar. "
-    "Evita bucles; si hay duda, reformula o sigue."
-)
+# ---------- Helpers: ICS/CSV/JSONL ----------
 
-def system_prompt_for(lang: str) -> str:
-    return SYSTEM_PROMPT_EN if (lang or "en").startswith("en") else SYSTEM_PROMPT_ES
+def _utc(dt: datetime) -> datetime:
+    return dt.astimezone(ZoneInfo("UTC"))
 
-# ---------- Storage helpers ----------
-def _day_path(day: datetime.date) -> Path:
-    return BOOK_DIR / f"{day.isoformat()}.jsonl"
+def _ics_ts(dt: datetime) -> str:
+    return _utc(dt).strftime("%Y%m%dT%H%M%SZ")
 
-def _ics_dt(dt: datetime) -> str:
-    u = dt.astimezone(ZoneInfo("UTC"))
-    return u.strftime("%Y%m%dT%H%M%SZ")
-
-def make_ics(uid: str, start_dt: datetime, end_dt: datetime, summary: str, description: str) -> str:
+def _ics(uid: str, start_dt: datetime, end_dt: datetime, summary: str, desc: str) -> str:
     nowz = datetime.now(ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
-    lines = [
+    return "\r\n".join([
         "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//FRG//Chloe//EN","CALSCALE:GREGORIAN","METHOD:PUBLISH",
         "BEGIN:VEVENT",
         f"UID:{uid}", f"DTSTAMP:{nowz}",
-        f"DTSTART:{_ics_dt(start_dt)}",
-        f"DTEND:{_ics_dt(end_dt)}",
-        f"SUMMARY:{summary}", f"DESCRIPTION:{description}",
+        f"DTSTART:{_ics_ts(start_dt)}", f"DTEND:{_ics_ts(end_dt)}",
+        f"SUMMARY:{summary}", f"DESCRIPTION:{desc}",
         "END:VEVENT","END:VCALENDAR",""
-    ]
-    return "\r\n".join(lines)
+    ])
 
-def write_row(rec: dict):
-    p = _day_path(datetime.now(TZ).date())
+DAYFILE = lambda d: (BOOK_DIR / f"{d.isoformat()}.jsonl")
+
+def _write_jsonl(day: date, rec: dict):
+    p = DAYFILE(day)
     with p.open("a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
-def save_booking(start_iso: str, name: str|None, address: str|None, caller: str|None, duration_min: int=30):
-    start_dt = datetime.fromisoformat(start_iso)
-    if start_dt.tzinfo is None:
-        start_dt = start_dt.replace(tzinfo=TZ)
-    end_dt = start_dt + timedelta(minutes=duration_min)
+
+def save_booking(args: dict) -> dict:
+    sid = uuid.uuid4().hex[:12]
+    start = datetime.fromisoformat(args["iso_start"]).astimezone(TZ)
+    dur = int(args.get("duration_min", 30))
+    end = start + timedelta(minutes=dur)
     rec = {
         "type": "booking",
-        "id": uuid.uuid4().hex[:12],
+        "id": sid,
         "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
-        "start": start_dt.isoformat(),
-        "end": end_dt.isoformat(),
-        "caller": caller or "",
-        "name": (name or "").strip(),
-        "address": (address or "").strip(),
-        "note": "Consultation",
-        "calendar_link": ""
+        "start": start.isoformat(),
+        "end": end.isoformat(),
+        "caller": args.get("phone") or "",
+        "name": (args.get("name") or "").strip(),
+        "address": (args.get("address") or "").strip(),
+        "note": args.get("note", "Consultation"),
+        "calendar_link": "",
     }
-    ics_text = make_ics(rec["id"], start_dt, end_dt,
-                        "Foreclosure Relief Consultation",
-                        f"Caller: {caller or 'unknown'}; Name: {rec['name']}; Address: {rec['address']}")
-    (ICS_DIR / f"{rec['id']}.ics").write_text(ics_text, encoding="utf-8")
-    write_row(rec)
+    ics_text = _ics(
+        sid, start, end,
+        f"{ORG_NAME} Consultation",
+        f"Caller: {rec['caller']}; Name: {rec['name']}; Address: {rec['address']}"
+    )
+    (ICS_DIR / f"{sid}.ics").write_text(ics_text, encoding="utf-8")
+    _write_jsonl(start.date(), rec)
+    try:
+        mirror = dict(rec); mirror["note"] = (mirror.get("note") or "") + "; mirror=true"
+        _write_jsonl(datetime.now(TZ).date(), mirror)
+    except Exception:
+        pass
     return rec
 
-def save_optout(name: str|None, address: str|None, phone: str|None):
+
+def save_optout(args: dict) -> dict:
+    sid = uuid.uuid4().hex[:12]
     rec = {
         "type": "optout",
-        "id": uuid.uuid4().hex[:12],
+        "id": sid,
         "created_at": datetime.now(ZoneInfo("UTC")).isoformat(),
         "start": "", "end": "",
-        "caller": phone or "",
-        "name": (name or "").strip(),
-        "address": (address or "").strip(),
-        "note": "DNC request",
-        "calendar_link": ""
+        "caller": args.get("phone") or "",
+        "name": (args.get("name") or "").strip(),
+        "address": (args.get("address") or "").strip(),
+        "note": "DNC request", "calendar_link": "",
     }
-    write_row(rec)
+    _write_jsonl(datetime.now(TZ).date(), rec)
     return rec
 
-# ---------- HTTP endpoints ----------
+
+def render_csv(d: date) -> str:
+    header = [
+        "id","record_type","created_at","caller","name","address",
+        "appointment_start","appointment_end","note","calendar_link",
+    ]
+    rows = []
+    p = DAYFILE(d)
+    if p.exists():
+        for line in p.read_text(encoding="utf-8").splitlines():
+            try:
+                j = json.loads(line)
+                rows.append([
+                    j.get("id",""), j.get("type",""), j.get("created_at",""),
+                    j.get("caller",""), j.get("name",""), j.get("address",""),
+                    j.get("start",""), j.get("end",""), j.get("note",""), j.get("calendar_link",""),
+                ])
+            except Exception:
+                continue
+    out = [",".join(header)]
+    for r in rows:
+        safe = ['"{}"'.format(str(x).replace('"','""')) for x in r]
+        out.append(",".join(safe))
+    return "\n".join(out)
+
+# ---------- HTTP: TwiML + reports ----------
 @app.post("/voice")
 async def voice(_: Request):
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    twiml = f"""<?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <Response>
   <Connect>
     <ConversationRelay
-      url="{RELAY_WSS_URL}"
-      ttsProvider="Amazon"
-      voice="Joanna-Neural">
-      <Language code="en-US"/>
-      <Language code="es-US"/>
+      url=\"{RELAY_WSS_URL}\"
+      transcriptionProvider=\"Deepgram\"
+      speechModel=\"nova-3-general\"
+      ttsProvider=\"Amazon\"> 
+      <Language code=\"en-US\" voice=\"Joanna-Neural\" />
+      <Language code=\"es-US\" voice=\"Lupe-Neural\" />
     </ConversationRelay>
   </Connect>
 </Response>"""
     return PlainTextResponse(twiml, media_type="text/xml")
 
+@app.get("/")
+async def index():
+    return PlainTextResponse("OK")
+
 @app.get("/health")
 async def health():
     return JSONResponse({"ok": True})
 
-@app.get("/")
-async def index():
-    return PlainTextResponse("OK")
+@app.get("/favicon.ico")
+async def favicon():
+    return Response(status_code=204)
 
 @app.get("/ics/{bid}.ics")
 async def get_ics(bid: str):
@@ -146,60 +181,60 @@ async def get_ics(bid: str):
         return PlainTextResponse(p.read_text(encoding="utf-8"), media_type="text/calendar; charset=utf-8")
     return Response(status_code=404)
 
-@app.get("/reports/today")
-async def report_today():
-    d = datetime.now(TZ).date()
-    p = _day_path(d)
-    if not p.exists():
-        return PlainTextResponse("id,record_type,created_at,caller,name,address,appointment_start,appointment_end,note,calendar_link\n", media_type="text/csv")
-    header = ["id","record_type","created_at","caller","name","address","appointment_start","appointment_end","note","calendar_link"]
-    out = [",".join(header)]
-    for line in p.read_text(encoding="utf-8").splitlines():
-        try:
-            j = json.loads(line)
-            row = [
-                j.get("id",""),
-                j.get("type",""),
-                j.get("created_at",""),
-                j.get("caller","") or "",
-                j.get("name","") or "",
-                j.get("address","") or "",
-                j.get("start",""),
-                j.get("end",""),
-                j.get("note","") or "",
-                j.get("calendar_link","") or "",
-            ]
-            safe = ['"{}"'.format(str(x).replace('"','""')) for x in row]
-            out.append(",".join(safe))
-        except Exception:
-            continue
-    return PlainTextResponse("\n".join(out), media_type="text/csv")
+@app.get("/reports/{day}")
+async def report_day(day: str):
+    try:
+        d = datetime.fromisoformat(day).date()
+    except Exception:
+        return JSONResponse({"error": "bad date"}, status_code=400)
+    csv_text = render_csv(d)
+    fname = f"appointments-{d.isoformat()}.csv"
+    return PlainTextResponse(csv_text, media_type="text/csv",
+        headers={"Content-Disposition": f"attachment; filename=\"{fname}\""})
 
-# ---------- CR <-> OpenAI Realtime bridge (text modality) ----------
-async def send_text(ws: WebSocket, token: str, last: bool):
-    # Only send Twilio-CR-compliant shapes
-    await ws.send_json({"type": "text", "token": token, "last": last})
+# ---------- OpenAI glue ----------
+SYSTEM_EN = (
+    "You are Chloe from " + ORG_NAME + ". Be warm and concise (≤2 short sentences). "
+    "Keep the entire call in the caller’s chosen language (English or Spanish). "
+    "Use file_search on the attached documents to answer questions accurately; cite briefly when helpful. "
+    "Only propose scheduling after the caller asks for next steps, asks to speak to a person, or confirms they want an appointment. "
+    "Before calling any tool, summarize the details you heard in ONE sentence and ask for a clear yes/no. "
+    "If the caller changes topic mid-flow, gracefully pivot—do NOT repeat prior prompts. "
+    "Never ask for the same field more than twice; if unclear, acknowledge and move on to clarify later."
+)
 
-TOOLS_SPEC = [
+SYSTEM_ES = (
+    "Eres Chloe de " + ORG_NAME + ". Sé cálida y concisa (≤2 frases). "
+    "Mantén toda la llamada en el idioma elegido (inglés o español). "
+    "Usa file_search en los documentos adjuntos para responder con precisión; incluye una cita breve cuando ayude. "
+    "Propón agendar solo cuando la persona pida próximos pasos, quiera hablar con alguien o confirme que desea una cita. "
+    "Antes de usar cualquier herramienta, resume los datos en UNA frase y pide un sí/no claro. "
+    "Si la persona cambia de tema, cambia con naturalidad—NO repitas solicitudes previas. "
+    "Nunca pidas el mismo dato más de dos veces; si no está claro, reconoce y avanza para aclararlo luego."
+)
+
+TOOLS = [
+    {"type": "file_search"},
     {
         "type": "function",
         "name": "book_appointment",
-        "description": "Save a consultation with name, address, and ISO8601 start time in business timezone.",
+        "description": "Book a consultation appointment.",
         "parameters": {
             "type": "object",
             "properties": {
+                "iso_start": {"type": "string", "description": "Start datetime in ISO 8601 with timezone."},
                 "name": {"type": "string"},
                 "address": {"type": "string"},
-                "iso_start": {"type": "string", "description": "ISO8601 datetime with timezone, e.g., 2025-09-20T15:00:00-07:00"},
+                "phone": {"type": "string"},
                 "duration_min": {"type": "integer", "default": 30}
             },
-            "required": ["iso_start"]
+            "required": ["iso_start", "name", "address"]
         }
     },
     {
         "type": "function",
         "name": "mark_opt_out",
-        "description": "Record a do-not-contact request with optional name/address/phone.",
+        "description": "Mark the caller as do-not-contact.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -207,181 +242,225 @@ TOOLS_SPEC = [
                 "address": {"type": "string"},
                 "phone": {"type": "string"}
             },
-            "required": []
+            "required": ["name"]
         }
     }
 ]
 
+# Booking invite must be explicit (yes/no question). Keeps guard tight.
+ASK_SCHED_EN = re.compile(r"\b(would you like to|shall we|do you want to) (schedule|book).+\?", re.I)
+ASK_SCHED_ES = re.compile(r"\b(quieres|deseas) (agendar|programar|concertar).+\?", re.I)
+LANG_HINT_RE = re.compile(r"\b(espanol|español|spanish|ingl[eé]s|english)\b", re.I)
+SCHED_RE = re.compile(r"\b(book|schedule|appointment|set\s*up|consult|cita|agendar|programar)\b", re.I)
+
+async def send_text(ws: WebSocket, text: str):
+    await ws.send_json({"type": "text", "token": text, "last": True})
+
+
+def invites_booking_now(assistant_text: str, lang: str | None) -> bool:
+    if not assistant_text:
+        return False
+    if lang == "es-US":
+        return bool(ASK_SCHED_ES.search(assistant_text))
+    return bool(ASK_SCHED_EN.search(assistant_text))
+
+
+def extract_tool_calls(resp_obj) -> list[dict]:
+    try:
+        d = resp_obj.to_dict() if hasattr(resp_obj, "to_dict") else resp_obj
+    except Exception:
+        d = resp_obj
+    calls = []
+    for item in (d.get("output") or []):
+        if item.get("type") == "tool_call":
+            tc = item.get("tool_call") or {}
+            calls.append(tc)
+    if not calls:
+        for item in (d.get("output") or []):
+            for c in (item.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "tool_call":
+                    calls.append(c.get("tool_call") or {})
+    return calls
+
+
+def output_text(resp_obj) -> str:
+    try:
+        return (resp_obj.output_text or "").strip()
+    except Exception:
+        d = resp_obj if isinstance(resp_obj, dict) else getattr(resp_obj, "to_dict", lambda: {})()
+        parts = []
+        for item in (d.get("output") or []):
+            for c in (item.get("content") or []):
+                if isinstance(c, dict) and c.get("type") == "output_text":
+                    parts.append(c.get("text") or "")
+        return " ".join(parts).strip()
+
+# ---------- WebSocket: Twilio connects here ----------
 @app.websocket("/relay")
 async def relay(ws: WebSocket):
-    """
-    Twilio ConversationRelay bridge to OpenAI Realtime.
-
-    This handler accepts the WebSocket from Twilio, opens a single
-    OpenAI Realtime session using the latest GA model and maintains
-    the full CR↔Realtime loop inside the context manager. Messages
-    from the caller are forwarded to OpenAI, and streaming tokens
-    and tool calls are handled and relayed back to Twilio.
-    """
     await ws.accept()
     print("ConversationRelay: connected", flush=True)
 
+    # Conversation state (per-call)
+    history: list[dict] = []
     caller_number: str | None = None
-    # default language; Twilio sends language codes like en-US / es-US
-    lang_code = "en"
+    chosen_lang: str | None = None   # "en-US" | "es-US"
+
+    # Booking guard state
+    offered_booking = False  # becomes True only when assistant explicitly asks to schedule
+    offered_token_id: str | None = None  # tracks the specific invite we made
 
     try:
-        # --- Open one OpenAI Realtime session and keep the ENTIRE loop inside ---
-        # Use the GA model gpt-realtime and the beta.realtime client which supports
-        # async context management. See docs【548398082812174†L307-L317】.
-        async with client.beta.realtime.connect(
-            model="gpt-realtime"
-        ) as rt:
-            # Initialize session once with text modality, system prompt and tools
-            instructions = system_prompt_for(lang_code)
-            await rt.session.update(session={
-                "modalities": ["text"],
-                "instructions": instructions,
-                "tools": TOOLS_SPEC
-            })
+        while True:
+            msg = await ws.receive_json()
+            mtype = msg.get("type")
 
-            # In-flight accumulation for function call arguments
-            call_buffer = ""
-            pending_call_id: str | None = None
-            # Main CR <-> OpenAI loop
-            while True:
-                msg = await ws.receive_json()
-                mtype = msg.get("type")
+            if mtype == "setup":
+                caller_number = (msg.get("from") or "").strip() or None
+                continue
 
-                if mtype == "setup":
-                    # Twilio sends caller info on setup; record it for later
-                    caller_number = (msg.get("from") or "").strip() or None
+            if mtype == "prompt":
+                user_text = (msg.get("voicePrompt") or "").strip()
+                if not user_text:
                     continue
+                print("RX:", user_text, flush=True)
 
-                if mtype == "language":
-                    code = (msg.get("language") or "").lower()
-                    # languages like en-us/es-us -> pick "en" or "es" for prompt selection
-                    lang_code = "es" if code.startswith("es") else "en"
-                    instructions = system_prompt_for(lang_code)
-                    await rt.session.update(session={"instructions": instructions})
-                    continue
-
-                if mtype == "prompt":
-                    # voicePrompt holds the transcribed text from Twilio STT
-                    user_text = (msg.get("voicePrompt") or "").strip()
-                    if not user_text:
+                # Language switch — must match TwiML <Language> codes
+                if LANG_HINT_RE.search(user_text):
+                    if re.search(r"espanol|español|spanish", user_text, re.I):
+                        chosen_lang = "es-US"
+                        await ws.send_json({"type":"language","transcriptionLanguage":"es-US","ttsLanguage":"es-US"})
+                        await send_text(ws, "Entendido. Puedo ayudarte en español.")
+                        # clear invite state so we don't misinterpret a later "sí" as consent
+                        offered_booking = False; offered_token_id = None
+                        continue
+                    if re.search(r"ingl[eé]s|english", user_text, re.I):
+                        chosen_lang = "en-US"
+                        await ws.send_json({"type":"language","transcriptionLanguage":"en-US","ttsLanguage":"en-US"})
+                        await send_text(ws, "Got it. I’ll continue in English.")
+                        offered_booking = False; offered_token_id = None
                         continue
 
-                    # Send the user's text as a conversation message to OpenAI
-                    await rt.conversation.item.create(item={
-                        "type": "message",
-                        "role": "user",
-                        "content": [{"type": "input_text", "text": user_text}]
-                    })
-                    # Request a response
-                    await rt.response.create()
+                system = SYSTEM_ES if chosen_lang == "es-US" else SYSTEM_EN
 
-                    # Reset call buffer for this turn
-                    call_buffer = ""
-                    pending_call_id = None
+                # Append user to history and call the model with running context
+                history.append({"role": "user", "content": user_text})
+                try:
+                    response = client.responses.create(
+                        model="gpt-4o-mini",
+                        input=[
+                            {"role": "system", "content": system},
+                            *history[-8:],
+                        ],
+                        tools=TOOLS,
+                        tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}} if VECTOR_STORE_ID else None,
+                        max_output_tokens=220,
+                        temperature=0.3,
+                    )
 
-                    # Stream events back to Twilio
-                    async for event in rt.stream():
-                        et = event.get("type")
+                except Exception as e:
+                    print("OpenAI error:", repr(e), flush=True)
+                    await send_text(ws, "Sorry, I had a problem—could you say that again?")
+                    continue
 
-                        # Stream incremental text
-                        if et == "response.text.delta":
-                            # Send partial token to Twilio, mark last=False
-                            await send_text(ws, event.get("delta") or "", False)
-                            continue
+                # Process tool calls first (if any)
+                tool_calls = extract_tool_calls(response)
+                if tool_calls:
+                    for tc in tool_calls:
+                        name = (tc.get("name") or "").strip()
+                        try:
+                            args = json.loads(tc.get("arguments") or "{}")
+                        except Exception:
+                            args = {}
 
-                        # Final text: send empty token to mark last=True. Some
-                        # implementations send the full text here, but Twilio
-                        # uses the token stream to build audio; an empty token
-                        # suffices to close the stream.
-                        if et == "response.text.done":
-                            await send_text(ws, event.get("text") or "", True)
-                            continue
+                        # Strict guard: only allow booking if we explicitly invited OR user explicitly asked to schedule OR full datetime provided
+                        if name == "book_appointment":
+                            explicit_user_intent = bool(SCHED_RE.search(user_text))
+                            allow = (offered_booking is True) or explicit_user_intent or bool(args.get("iso_start"))
+                            if not allow:
+                                result = {"ok": False, "error": "guard_blocked_need_explicit_intent"}
+                            else:
+                                if caller_number and not args.get("phone"):
+                                    args["phone"] = caller_number
+                                try:
+                                    out = save_booking(args)
+                                    result = {"ok": True, "id": out["id"], "start": out["start"], "end": out["end"]}
+                                except Exception as e:
+                                    result = {"ok": False, "error": f"booking_failed: {e}"}
+                            # Regardless, consume the invite so a later "yes" doesn't loop
+                            offered_booking = False; offered_token_id = None
 
-                        # Accumulate function call arguments during streaming
-                        if et == "response.function_call_arguments.delta":
-                            # Append partial JSON string to our buffer
-                            call_buffer += event.get("delta") or ""
-                            # Record call_id for later
-                            pending_call_id = event.get("call_id") or pending_call_id
-                            continue
-
-                        # When arguments are done, call the tool
-                        if et == "response.function_call_arguments.done":
-                            # Ensure we have call_id; fallback to event call_id
-                            call_id = event.get("call_id") or pending_call_id or uuid.uuid4().hex
-                            # Full arguments JSON string
-                            args_str = event.get("arguments") or call_buffer or "{}"
+                        elif name == "mark_opt_out":
+                            if caller_number and not args.get("phone"):
+                                args["phone"] = caller_number
                             try:
-                                args = json.loads(args_str)
-                            except Exception:
-                                args = {}
-
-                            # Choose tool based on presence of iso_start
-                            tool_name: str
-                            result: dict
-                            try:
-                                if args.get("iso_start"):
-                                    # Book appointment
-                                    rec = save_booking(
-                                        start_iso=args.get("iso_start"),
-                                        name=args.get("name"),
-                                        address=args.get("address"),
-                                        caller=caller_number,
-                                        duration_min=int(args.get("duration_min") or 30)
-                                    )
-                                    result = {"ok": True, "id": rec["id"], "ics_url": f"/ics/{rec['id']}.ics"}
-                                    tool_name = "book_appointment"
-                                else:
-                                    # Mark opt out
-                                    rec = save_optout(
-                                        name=args.get("name"),
-                                        address=args.get("address"),
-                                        phone=caller_number or args.get("phone")
-                                    )
-                                    result = {"ok": True, "id": rec["id"]}
-                                    tool_name = "mark_opt_out"
+                                out = save_optout(args)
+                                result = {"ok": True, "id": out["id"]}
                             except Exception as e:
-                                result = {"ok": False, "error": repr(e)}
-                                tool_name = args.get("iso_start") and "book_appointment" or "mark_opt_out"
+                                result = {"ok": False, "error": f"optout_failed: {e}"}
+                        else:
+                            result = {"ok": False, "error": f"unknown_tool: {name}"}
 
-                            # Send tool result back to OpenAI. Use call_id to correlate.
-                            await rt.response.create(
-                                response={
-                                    "type": "tool_result",
-                                    "tool_call_id": call_id,
-                                    "output": result
-                                }
-                            )
-                            # Reset buffer after calling tool
-                            call_buffer = ""
-                            pending_call_id = None
-                            continue
+                        # Record tool call + result then ask the model for the closing
+                        tool_id = tc.get("id") or uuid.uuid4().hex
+                        history.append({
+                            "role": "assistant",
+                            "content": [{
+                                "type": "tool_call",
+                                "id": tool_id,
+                                "name": name,
+                                "arguments": json.dumps(args, ensure_ascii=False)
+                            }]
+                        })
+                        history.append({
+                            "role": "tool",
+                            "content": json.dumps(result, ensure_ascii=False),
+                            "name": name,
+                            "tool_call_id": tool_id
+                        })
 
-                        # End of response
-                        if et == "response.done":
-                            break
+                        follow = client.responses.create(
+                            model="gpt-4o-mini",
+                            input=[{"role":"system","content": system}, *history[-24:]],
+                            tools=TOOLS,
+                            tool_resources={"file_search": {"vector_store_ids": [VECTOR_STORE_ID]}} if VECTOR_STORE_ID else None,
+                            max_output_tokens=180,
+                            temperature=0.2,
+                        )
 
-                        # Log any errors but don't send to Twilio (to avoid 64107)
-                        if et in ("response.error", "error"):
-                            print("Realtime error:", event, flush=True)
-                            break
+                        final_text = output_text(follow) or "Done."
+                        history.append({"role": "assistant", "content": final_text})
+
+                        # Set/clear booking invite only if assistant explicitly asks now
+                        offered_booking = invites_booking_now(final_text, chosen_lang)
+                        offered_token_id = uuid.uuid4().hex if offered_booking else None
+
+                        await send_text(ws, final_text)
                     continue
 
-                if mtype == "interrupt":
-                    # A barge-in from the caller. We'll let the model handle turn
-                    # detection natively. Do not send anything back to Twilio.
-                    print("Interrupted:", msg.get("utteranceUntilInterrupt", ""), flush=True)
-                    continue
+                # No tools — send the model’s direct answer
+                text = output_text(response) or "Could you say that again?"
+                history.append({"role": "assistant", "content": text})
 
-                if mtype == "error":
-                    print("CR error:", msg.get("description"), flush=True)
-                    continue
+                # Update invite tracking based on THIS assistant turn
+                offered_booking = invites_booking_now(text, chosen_lang)
+                offered_token_id = uuid.uuid4().hex if offered_booking else None
+
+                await send_text(ws, text)
+                continue
+
+            if mtype == "interrupt":
+                cut = (msg.get("utteranceUntilInterrupt") or "").strip()
+                print("Interrupted:", cut, flush=True)
+                # Mark a gentle acknowledgement in history so the next turn continues naturally
+                history.append({"role": "assistant", "content": "Understood—go ahead."})
+                # Any old invite is no longer valid after a barge-in
+                offered_booking = False; offered_token_id = None
+                continue
+
+            if mtype == "error":
+                print("ConversationRelay error:", msg.get("description"), flush=True)
+                continue
 
     except WebSocketDisconnect:
         print("ConversationRelay: disconnected", flush=True)
