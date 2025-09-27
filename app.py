@@ -47,7 +47,16 @@ APP_VERSION = os.environ.get("APP_VERSION", "local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 RELAY_WSS_URL = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
-VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
+# Use separate vector store IDs for call scripts and policies.  If either is
+# empty, the file_search tool will be omitted for that call.  To retain
+# backwards‑compatibility with a single store setup, fall back to
+# VECTOR_STORE_ID if VECTOR_STORE_CALLSCRIPTS_ID is not provided.
+VECTOR_STORE_CALLSCRIPTS_ID = (
+    os.environ.get("VECTOR_STORE_CALLSCRIPTS_ID")
+    or os.environ.get("VECTOR_STORE_ID")
+    or ""
+).strip()
+VECTOR_STORE_POLICIES_ID = os.environ.get("VECTOR_STORE_POLICIES_ID", "").strip()
 ORG_NAME = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
 
 # Print startup info and a build marker for debugging deployments.
