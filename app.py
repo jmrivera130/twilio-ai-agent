@@ -12,8 +12,7 @@ Environment variables:
   OPENAI_API_KEY   – your OpenAI API key (required)
   RELAY_WSS_URL    – ws URL for Twilio ConversationRelay (e.g. wss://<domain>/relay)
   TIMEZONE         – IANA timezone for your business (default America/Los_Angeles)
-  VECTOR_STORE_CALLSCRIPTS_ID  – ID of your CallScripts vector store (required)
-  VECTOR_STORE_POLICIES_ID     – ID of your Policies vector store (required)
+  VECTOR_STORE_ID  – ID of your OpenAI vector store (optional)
   ORG_NAME         – your organization’s name (default "Foreclosure Relief Group")
   APP_VERSION      – version string shown at startup (optional)
 
@@ -48,15 +47,8 @@ APP_VERSION = os.environ.get("APP_VERSION", "local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 RELAY_WSS_URL = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
+VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
 ORG_NAME = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
-
-# Vector store identifiers for Responses file_search.  You must provide these via
-# environment variables.  Files contained in the CallScripts store should hold
-# conversational snippets, while the Policies store contains brief factual FAQ
-# cards.  These values may be empty; when empty, the file_search tool will be
-# omitted from the model call, and no retrieval will occur.
-VECTOR_STORE_CALLSCRIPTS_ID = os.environ.get("VECTOR_STORE_CALLSCRIPTS_ID", "").strip()
-VECTOR_STORE_POLICIES_ID = os.environ.get("VECTOR_STORE_POLICIES_ID", "").strip()
 
 # Print startup info and a build marker for debugging deployments.
 print("=== NEW BUILD LOADED ===", flush=True)
@@ -286,11 +278,15 @@ SYSTEM_ES = (
     "Si encuentras un error o no puedes obtener la información solicitada, discúlpate brevemente y pide que repita o aclare. "
 )
 
-# Prepare the base function tools.  We separate function tools from file_search so that
-# we can dynamically choose the appropriate vector store on each call.  These tools
-# remain constant throughout the call.  When building the tools list for a model
-# invocation, we will prepend a file_search entry with the selected vector store ID
-# (if available) and then append these function tools.
+# Regular expressions for booking guard and language hints remain above.
+
+# Detect factual questions that should trigger the Policies vector store.
+POLICY_QUESTION_RE = re.compile(
+    r"\b(what|why|how|que|qué|porque|por\s+qué|como|cómo)\b", re.I
+)
+
+# Base function tools definitions.  These remain constant for each call and are
+# appended to the dynamic tools list built per user utterance.
 FUNCTION_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
@@ -304,7 +300,7 @@ FUNCTION_TOOLS: list[dict[str, object]] = [
                 "address": {"type": "string"},
                 "phone": {"type": "string"},
                 "duration_min": {"type": "integer", "default": 30},
-                "note": {"type": "string"}
+                "note": {"type": "string"},
             },
             "required": ["iso_start", "name", "address"],
         },
@@ -325,42 +321,22 @@ FUNCTION_TOOLS: list[dict[str, object]] = [
     },
 ]
 
-# Regular expressions for booking guard and language hints
-ASK_SCHED_EN = re.compile(r"\b(would you like to|shall we|do you want to) (schedule|book).+\?", re.I)
-ASK_SCHED_ES = re.compile(r"\b(quieres|deseas) (agendar|programar|concertar).+\?", re.I)
-LANG_HINT_RE = re.compile(r"\b(espanol|español|spanish|ingl[eé]s|english)\b", re.I)
-SCHED_RE = re.compile(r"\b(book|schedule|appointment|set\s*up|consult|cita|agendar|programar)\b", re.I)
-
-# Patterns to detect factual questions that should trigger the Policies vector store.
-# Match common English and Spanish interrogatives.  If any of these words are
-# present in the caller's utterance, we treat the request as a factual question
-# and choose the Policies vector store; otherwise we use the CallScripts store.
-POLICY_QUESTION_RE = re.compile(
-    r"\b(what|why|how|que|qué|porque|por\s+qué|como|cómo)\b", re.I
-)
-
 def choose_vector_store(user_text: str) -> str:
-    """
-    Select the appropriate vector store ID based on the caller's message.
+    """Select the appropriate vector store ID based on the caller's message.
 
-    :param user_text: The caller's latest utterance
-    :return: ID of the Policies store if the utterance appears to be a factual
-             question, otherwise the CallScripts store ID.  Returns an empty
-             string if neither store is configured.
+    If the message appears to be a factual question (starts with what/why/how/etc.),
+    return the Policies store ID; otherwise return the CallScripts store ID. If
+    neither is configured, return an empty string.
     """
     if POLICY_QUESTION_RE.search(user_text or ""):
         return VECTOR_STORE_POLICIES_ID or VECTOR_STORE_CALLSCRIPTS_ID
     return VECTOR_STORE_CALLSCRIPTS_ID or VECTOR_STORE_POLICIES_ID
 
 def build_tools_for_user(user_text: str) -> list[dict]:
-    """
-    Build the tools array for the Responses API call based on the caller's
-    utterance.
+    """Build a tools list for the Responses API call.
 
-    Adds a file_search tool with the chosen vector store ID (if available) and
-    appends the function tools.  If no vector store ID is configured, the
-    file_search tool is omitted.  Always includes the booking and opt-out
-    function tools.
+    Prepend a file_search tool with the selected vector store ID (if any) to the list
+    of function tools. If no vector store ID is configured, omit the file_search tool.
     """
     vs_id = choose_vector_store(user_text)
     tools: list[dict] = []
@@ -368,6 +344,12 @@ def build_tools_for_user(user_text: str) -> list[dict]:
         tools.append({"type": "file_search", "vector_store_ids": [vs_id]})
     tools.extend(FUNCTION_TOOLS)
     return tools
+
+# Regular expressions for booking guard and language hints
+ASK_SCHED_EN = re.compile(r"\b(would you like to|shall we|do you want to) (schedule|book).+\?", re.I)
+ASK_SCHED_ES = re.compile(r"\b(quieres|deseas) (agendar|programar|concertar).+\?", re.I)
+LANG_HINT_RE = re.compile(r"\b(espanol|español|spanish|ingl[eé]s|english)\b", re.I)
+SCHED_RE = re.compile(r"\b(book|schedule|appointment|set\s*up|consult|cita|agendar|programar)\b", re.I)
 
 async def send_text(ws: WebSocket, text: str) -> None:
     """Send a complete utterance to Twilio CR."""
@@ -425,9 +407,6 @@ async def relay(ws: WebSocket) -> None:
     history: list[dict] = []
     caller_number: str | None = None
     chosen_lang: str | None = None  # "en-US" or "es-US"
-    # Flag to send an immediate greeting on the very first user prompt.  We send
-    # the greeting before making any model call to reduce perceived latency.
-    first_prompt_done = False
 
     # Booking guard state: these flags track whether we've offered a booking invite
     offered_booking = False
@@ -447,19 +426,6 @@ async def relay(ws: WebSocket) -> None:
                 if not user_text:
                     continue
                 print("RX:", user_text, flush=True)
-
-                # Send an immediate greeting on the very first user utterance to
-                # reduce perceived latency.  Ask for language preference up front
-                # and skip model invocation on this turn.
-                if not first_prompt_done:
-                    first_prompt_done = True
-                    greeting = (
-                        f"Hello! I'm Chloe from {ORG_NAME}. "
-                        "Would you like to continue in English or Spanish?"
-                    )
-                    await send_text(ws, greeting)
-                    offered_booking = False; offered_token_id = None
-                    continue
 
                 # Handle language hints and mid‑call language switching
                 if LANG_HINT_RE.search(user_text):
