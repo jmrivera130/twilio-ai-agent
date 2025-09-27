@@ -47,7 +47,16 @@ APP_VERSION = os.environ.get("APP_VERSION", "local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 RELAY_WSS_URL = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
-VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")
+# Use separate vector store IDs for call scripts and policies.  If either is
+# empty, the file_search tool will be omitted for that call.  To retain
+# backwards‑compatibility with a single store setup, fall back to
+# VECTOR_STORE_ID if VECTOR_STORE_CALLSCRIPTS_ID is not provided.
+VECTOR_STORE_CALLSCRIPTS_ID = (
+    os.environ.get("VECTOR_STORE_CALLSCRIPTS_ID")
+    or os.environ.get("VECTOR_STORE_ID")
+    or ""
+).strip()
+VECTOR_STORE_POLICIES_ID = os.environ.get("VECTOR_STORE_POLICIES_ID", "").strip()
 ORG_NAME = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
 
 # Print startup info and a build marker for debugging deployments.
@@ -278,45 +287,80 @@ SYSTEM_ES = (
     "Si encuentras un error o no puedes obtener la información solicitada, discúlpate brevemente y pide que repita o aclare. "
 )
 
-# Prepare the tools. The file_search tool gets the vector_store_id directly on the tool entry.
-search_tool: dict[str, object] = {"type": "file_search"}
-if VECTOR_STORE_ID:
-    search_tool["vector_store_ids"] = [VECTOR_STORE_ID]
+# Regular expressions for booking guard and language hints remain above.
 
-TOOLS: list[dict[str, object]] = [
-    search_tool,
+# Detect factual questions that should trigger the Policies vector store.
+POLICY_QUESTION_RE = re.compile(
+    r"\b(what|why|how|que|qué|porque|por\s+qué|como|cómo)\b", re.I
+)
+
+# Base function tools definitions.  These remain constant for each call and are
+# appended to the dynamic tools list built per user utterance.
+# Define function tools using the modern Responses API schema.  Each entry
+# must have a "type" of "function" and a nested "function" object with
+# name, description, and parameters fields.  See OpenAI Responses API docs
+# (Sept 2025) for details【552313873166555†screenshot】.
+FUNCTION_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
-        "name": "book_appointment",
-        "description": "Book a consultation appointment.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "iso_start": {"type": "string", "description": "Start datetime in ISO 8601 with timezone."},
-                "name": {"type": "string"},
-                "address": {"type": "string"},
-                "phone": {"type": "string"},
-                "duration_min": {"type": "integer", "default": 30},
-                "note": {"type": "string"}
+        "function": {
+            "name": "book_appointment",
+            "description": "Book a consultation appointment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "iso_start": {"type": "string", "description": "Start datetime in ISO 8601 with timezone."},
+                    "name": {"type": "string"},
+                    "address": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "duration_min": {"type": "integer", "default": 30},
+                    "note": {"type": "string"},
+                },
+                "required": ["iso_start", "name", "address"],
             },
-            "required": ["iso_start", "name", "address"],
         },
     },
     {
         "type": "function",
-        "name": "mark_opt_out",
-        "description": "Mark the caller as do‑not‑contact.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "address": {"type": "string"},
-                "phone": {"type": "string"},
+        "function": {
+            "name": "mark_opt_out",
+            "description": "Mark the caller as do‑not‑contact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "address": {"type": "string"},
+                    "phone": {"type": "string"},
+                },
+                "required": ["name"],
             },
-            "required": ["name"],
         },
     },
 ]
+
+def choose_vector_store(user_text: str) -> str:
+    """Select the appropriate vector store ID based on the caller's message.
+
+    If the message appears to be a factual question (starts with what/why/how/etc.),
+    return the Policies store ID; otherwise return the CallScripts store ID. If
+    neither is configured, return an empty string.
+    """
+    if POLICY_QUESTION_RE.search(user_text or ""):
+        return VECTOR_STORE_POLICIES_ID or VECTOR_STORE_CALLSCRIPTS_ID
+    return VECTOR_STORE_CALLSCRIPTS_ID or VECTOR_STORE_POLICIES_ID
+
+def build_tools_for_user(user_text: str) -> list[dict]:
+    """Build a tools list for the Responses API call.
+
+    Prepend a file_search tool with the selected vector store ID (if any) to the list
+    of function tools. If no vector store ID is configured, omit the file_search tool.
+    """
+    vs_id = choose_vector_store(user_text)
+    tools: list[dict] = []
+    if vs_id:
+        tools.append({"type": "file_search", "vector_store_ids": [vs_id]})
+    tools.extend(FUNCTION_TOOLS)
+    return tools
 
 # Regular expressions for booking guard and language hints
 ASK_SCHED_EN = re.compile(r"\b(would you like to|shall we|do you want to) (schedule|book).+\?", re.I)
@@ -427,7 +471,7 @@ async def relay(ws: WebSocket) -> None:
                             {"role": "system", "content": system},
                             *history[-8:],
                         ],
-                        tools=TOOLS,
+                        tools=build_tools_for_user(user_text),
                         max_output_tokens=220,
                         temperature=0.3,
                     )
@@ -497,7 +541,7 @@ async def relay(ws: WebSocket) -> None:
                         follow = await client.responses.create(
                             model="gpt-4o-mini",
                             input=[{"role": "system", "content": system}, *history[-24:]],
-                            tools=TOOLS,
+                            tools=build_tools_for_user(""),
                             max_output_tokens=180,
                             temperature=0.2,
                         )
