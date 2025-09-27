@@ -12,7 +12,8 @@ Environment variables:
   OPENAI_API_KEY   – your OpenAI API key (required)
   RELAY_WSS_URL    – ws URL for Twilio ConversationRelay (e.g. wss://<domain>/relay)
   TIMEZONE         – IANA timezone for your business (default America/Los_Angeles)
-  VECTOR_STORE_ID  – ID of your OpenAI vector store (optional)
+  VECTOR_STORE_CALLSCRIPTS_ID  – ID of your CallScripts vector store (required)
+  VECTOR_STORE_POLICIES_ID     – ID of your Policies vector store (required)
   ORG_NAME         – your organization’s name (default "Foreclosure Relief Group")
   APP_VERSION      – version string shown at startup (optional)
 
@@ -47,12 +48,15 @@ APP_VERSION = os.environ.get("APP_VERSION", "local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
 RELAY_WSS_URL = os.environ["RELAY_WSS_URL"]
 BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
-# Vector store IDs for call scripts and policies. To use separate stores for
-# conversational flow and factual Q&A, set these environment variables.
-CALL_SCRIPTS_STORE_ID = os.environ.get("VECTOR_STORE_CALLSCRIPTS_ID", "")
-POLICIES_STORE_ID = os.environ.get("VECTOR_STORE_POLICIES_ID", "")
-VECTOR_STORE_ID = os.environ.get("VECTOR_STORE_ID", "")  # legacy single‑store support
 ORG_NAME = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
+
+# Vector store identifiers for Responses file_search.  You must provide these via
+# environment variables.  Files contained in the CallScripts store should hold
+# conversational snippets, while the Policies store contains brief factual FAQ
+# cards.  These values may be empty; when empty, the file_search tool will be
+# omitted from the model call, and no retrieval will occur.
+VECTOR_STORE_CALLSCRIPTS_ID = os.environ.get("VECTOR_STORE_CALLSCRIPTS_ID", "").strip()
+VECTOR_STORE_POLICIES_ID = os.environ.get("VECTOR_STORE_POLICIES_ID", "").strip()
 
 # Print startup info and a build marker for debugging deployments.
 print("=== NEW BUILD LOADED ===", flush=True)
@@ -239,42 +243,54 @@ async def report_day(day: str) -> Response:
 # ---------------------------------------------------------------------------
 
 SYSTEM_EN = (
-    # Core persona and tone
+    # Introduction and tone
     "You are Chloe from " + ORG_NAME + ", a real human advisor helping homeowners facing foreclosure. "
-    "Speak like a person, not like an automated system. Keep each answer to at most two short sentences and then ask a question to keep the conversation moving. "
-    # Confidentiality and resource use
-    "Do not mention documents, uploaded files, vector stores or tools to the caller—these are internal. You may use internal resources, but never reference them or cite. "
-    # Scheduling guidance and flow
-    "Only suggest scheduling an appointment after the caller asks about next steps, expresses a desire to speak with someone, or clearly asks to schedule. "
-    "When booking, collect information step by step: first ask for the desired date and time, then confirm the name on the property, then the property address. Do not ask for all details at once. Summarize briefly and ask for a clear yes/no before booking. "
-    # Interruptions and topic changes
-    "If the caller interrupts while you are speaking, stop immediately and respond to what they said in one short sentence before continuing. If they change topic, pivot gracefully without repeating prior prompts. Never ask for the same field more than twice. "
-    # Q&A brevity
-    "If the caller asks a definition or explanation (questions starting with what, why or how), answer succinctly in one sentence and then offer to continue or schedule. "
+    "On the first interaction with a caller, greet them warmly, introduce yourself and " + ORG_NAME + ", "
+    "and briefly explain that you assist people exploring options to avoid foreclosure. "
+    "Politely ask whether they prefer to continue in English or Spanish, and keep the call in their chosen language. "
+    # Empathy and brevity
+    "Throughout the call, be empathetic and concise—keep replies to no more than two short sentences. "
+    "Internally, use the file_search tool to retrieve information when needed, but never mention documents, PDFs or citations to the caller. "
+    "Summarize information gently; if multiple alternatives exist, offer to discuss them one at a time or to schedule a consultation. "
+    # Scheduling guidance
+    "Only propose scheduling an appointment after the caller asks for next steps, expresses a desire to speak with someone, or confirms they want an appointment. "
+    "Before calling any tool, summarize the details you heard in one sentence and ask for a clear yes/no. "
+    "When booking an appointment, collect information step by step: first ask for the desired date and time, then confirm the name and the property address. Do not ask for all details at once. "
+    # Flow and interruptions
+    "If the caller changes topic mid‑flow, pivot gracefully—do NOT repeat prior prompts. "
+    "Never ask for the same field more than twice; if unclear, acknowledge and move on to clarify later. "
+    "If the caller interrupts while you are speaking, stop immediately and acknowledge their input in one sentence before continuing. "
     # Error handling
     "If you encounter an error or cannot retrieve the requested information, apologize briefly and ask them to repeat or clarify. "
 )
 
 SYSTEM_ES = (
-    # Núcleo de persona y tono
+    # Presentación y tono
     "Eres Chloe de " + ORG_NAME + ", una asesora real que ayuda a propietarios que enfrentan la ejecución hipotecaria. "
-    "Habla como una persona, no como un sistema automatizado. Mantén cada respuesta en un máximo de dos frases cortas y luego haz una pregunta para mantener la conversación. "
-    # Confidencialidad y uso de recursos
-    "No menciones documentos, archivos subidos, vectores ni herramientas al interlocutor; esto es interno. Puedes usar recursos internos, pero nunca referenciarlos ni citarlos. "
-    # Guía de agendamiento y flujo
-    "Sugiere agendar una cita solo cuando la persona pregunte por próximos pasos, exprese deseo de hablar con alguien o pida claramente agendar. "
-    "Al agendar, recopila la información paso a paso: primero pregunta la fecha y hora deseadas, luego confirma el nombre en la propiedad, luego la dirección. No pidas todos los datos a la vez. Resume brevemente y pide un sí/no claro antes de reservar. "
-    # Interrupciones y cambios de tema
-    "Si la persona te interrumpe mientras hablas, detente inmediatamente y responde a lo que dijo en una frase corta antes de continuar. Si cambia de tema, adapta la conversación de manera natural sin repetir peticiones previas. Nunca pidas el mismo dato más de dos veces. "
-    # Brevedad en preguntas de tipo explicación
-    "Si la persona hace una pregunta de definición o explicación (qué, por qué, cómo), contesta de forma sucinta en una frase y luego ofrece continuar o agendar. "
+    "En la primera interacción con la persona, salúdala con calidez, preséntate y presenta a " + ORG_NAME + ", "
+    "y explica brevemente que ayudas a explorar opciones para evitar la ejecución. "
+    "Pregunta amablemente si prefiere continuar en inglés o español y mantén la llamada en el idioma elegido. "
+    # Empatía y brevedad
+    "A lo largo de la llamada, sé empática y concisa; no uses más de dos frases cortas por respuesta. "
+    "Internamente, utiliza la herramienta file_search para recuperar información cuando sea necesario, pero nunca menciones documentos, archivos PDF ni citas a la persona. "
+    "Resume la información con suavidad; si existen varias alternativas, ofrécele tratarlas una por una o programar una consulta. "
+    # Guía para agendar
+    "Propón agendar una cita solo cuando la persona pida los siguientes pasos, exprese deseo de hablar con alguien o confirme que quiere una cita. "
+    "Antes de usar cualquier herramienta, resume los datos en una frase y pide un sí/no claro. "
+    "Al programar una cita, recopila la información paso a paso: primero pregunta la fecha y hora deseadas, luego confirma el nombre y la dirección de la propiedad. No pidas todos los datos de una sola vez. "
+    # Flujo e interrupciones
+    "Si la persona cambia de tema, adapta la conversación de manera natural—NO repitas solicitudes previas. "
+    "Nunca pidas el mismo dato más de dos veces; si no está claro, reconoce y continúa para aclararlo luego. "
+    "Si la persona te interrumpe mientras hablas, detente de inmediato y reconoce su comentario en una frase antes de continuar. "
     # Manejo de errores
     "Si encuentras un error o no puedes obtener la información solicitada, discúlpate brevemente y pide que repita o aclare. "
 )
 
-# Prepare the function tools. The file_search tool will be added dynamically
-# with the appropriate vector_store_ids on each call. These function tools
-# remain constant across calls.
+# Prepare the base function tools.  We separate function tools from file_search so that
+# we can dynamically choose the appropriate vector store on each call.  These tools
+# remain constant throughout the call.  When building the tools list for a model
+# invocation, we will prepend a file_search entry with the selected vector store ID
+# (if available) and then append these function tools.
 FUNCTION_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
@@ -315,10 +331,43 @@ ASK_SCHED_ES = re.compile(r"\b(quieres|deseas) (agendar|programar|concertar).+\?
 LANG_HINT_RE = re.compile(r"\b(espanol|español|spanish|ingl[eé]s|english)\b", re.I)
 SCHED_RE = re.compile(r"\b(book|schedule|appointment|set\s*up|consult|cita|agendar|programar)\b", re.I)
 
-# Questions regex: detect when a user asks a definition or explanation. If a question
-# matches this pattern, we'll route the query to the policies store. Covers
-# English (what, why, how) and Spanish (qué, por qué, cómo).
-QA_RE = re.compile(r"\b(what|why|how|que|qué|por qué|como|cómo)\b", re.I)
+# Patterns to detect factual questions that should trigger the Policies vector store.
+# Match common English and Spanish interrogatives.  If any of these words are
+# present in the caller's utterance, we treat the request as a factual question
+# and choose the Policies vector store; otherwise we use the CallScripts store.
+POLICY_QUESTION_RE = re.compile(
+    r"\b(what|why|how|que|qué|porque|por\s+qué|como|cómo)\b", re.I
+)
+
+def choose_vector_store(user_text: str) -> str:
+    """
+    Select the appropriate vector store ID based on the caller's message.
+
+    :param user_text: The caller's latest utterance
+    :return: ID of the Policies store if the utterance appears to be a factual
+             question, otherwise the CallScripts store ID.  Returns an empty
+             string if neither store is configured.
+    """
+    if POLICY_QUESTION_RE.search(user_text or ""):
+        return VECTOR_STORE_POLICIES_ID or VECTOR_STORE_CALLSCRIPTS_ID
+    return VECTOR_STORE_CALLSCRIPTS_ID or VECTOR_STORE_POLICIES_ID
+
+def build_tools_for_user(user_text: str) -> list[dict]:
+    """
+    Build the tools array for the Responses API call based on the caller's
+    utterance.
+
+    Adds a file_search tool with the chosen vector store ID (if available) and
+    appends the function tools.  If no vector store ID is configured, the
+    file_search tool is omitted.  Always includes the booking and opt-out
+    function tools.
+    """
+    vs_id = choose_vector_store(user_text)
+    tools: list[dict] = []
+    if vs_id:
+        tools.append({"type": "file_search", "vector_store_ids": [vs_id]})
+    tools.extend(FUNCTION_TOOLS)
+    return tools
 
 async def send_text(ws: WebSocket, text: str) -> None:
     """Send a complete utterance to Twilio CR."""
@@ -376,6 +425,9 @@ async def relay(ws: WebSocket) -> None:
     history: list[dict] = []
     caller_number: str | None = None
     chosen_lang: str | None = None  # "en-US" or "es-US"
+    # Flag to send an immediate greeting on the very first user prompt.  We send
+    # the greeting before making any model call to reduce perceived latency.
+    first_prompt_done = False
 
     # Booking guard state: these flags track whether we've offered a booking invite
     offered_booking = False
@@ -396,18 +448,16 @@ async def relay(ws: WebSocket) -> None:
                     continue
                 print("RX:", user_text, flush=True)
 
-                # If this is the very first message, send a greeting immediately and skip model call.
-                if not history:
-                    # Send a human introduction and ask for language preference. This reduces
-                    # perceived latency by avoiding a cold model call on the greeting.
-                    greet = (
-                        "Hi, this is Chloe with " + ORG_NAME + ". I help homeowners avoid foreclosure by setting quick consultations to review options. "
-                        "Would you like English or Spanish?"
+                # Send an immediate greeting on the very first user utterance to
+                # reduce perceived latency.  Ask for language preference up front
+                # and skip model invocation on this turn.
+                if not first_prompt_done:
+                    first_prompt_done = True
+                    greeting = (
+                        f"Hello! I'm Chloe from {ORG_NAME}. "
+                        "Would you like to continue in English or Spanish?"
                     )
-                    # Default language on greeting remains English; the user can switch via language hints.
-                    await send_text(ws, greet)
-                    # Record the greeting in history as an assistant turn
-                    history.append({"role": "assistant", "content": greet})
+                    await send_text(ws, greeting)
                     offered_booking = False; offered_token_id = None
                     continue
 
@@ -429,35 +479,16 @@ async def relay(ws: WebSocket) -> None:
                 # Determine which system prompt to use
                 system = SYSTEM_ES if chosen_lang == "es-US" else SYSTEM_EN
 
-                # Decide which vector store to search based on question type. If the user
-                # asks a definition/explanation (what/why/how), use the policies store.
-                if QA_RE.search(user_text) and POLICIES_STORE_ID:
-                    active_store_id = POLICIES_STORE_ID
-                else:
-                    # Prefer the call scripts store if set; otherwise fall back to the legacy single store.
-                    active_store_id = CALL_SCRIPTS_STORE_ID or VECTOR_STORE_ID or ""
-
-                # Build tools list dynamically. Include file_search only if we have a store.
-                tools = []
-                tool_resources = None
-                if active_store_id:
-                    tools.append({"type": "file_search"})
-                    tool_resources = {"file_search": {"vector_store_ids": [active_store_id]}}
-                # Add function tools
-                tools.extend(FUNCTION_TOOLS)
-
-                # Append the user message to history
+                # Append the user message to history and call the model
                 history.append({"role": "user", "content": user_text})
                 try:
-                    # Call the OpenAI Responses API with dynamic tools and resources
                     response = await client.responses.create(
                         model="gpt-4o-mini",
                         input=[
                             {"role": "system", "content": system},
                             *history[-8:],
                         ],
-                        tools=tools,
-                        tool_resources=tool_resources,
+                        tools=build_tools_for_user(user_text),
                         max_output_tokens=220,
                         temperature=0.3,
                     )
@@ -476,8 +507,7 @@ async def relay(ws: WebSocket) -> None:
                         except Exception:
                             args = {}
 
-                        # Strict booking guard: only allow booking if invited, the user expressed scheduling intent,
-                        # or a complete iso_start was provided.
+                        # Strict booking guard: only allow booking if we invited, or user asked to schedule, or we have a full iso_start
                         if name == "book_appointment":
                             explicit_user_intent = bool(SCHED_RE.search(user_text))
                             allow = (offered_booking is True) or explicit_user_intent or bool(args.get("iso_start"))
@@ -524,19 +554,11 @@ async def relay(ws: WebSocket) -> None:
                             "tool_call_id": tool_id,
                         })
 
-                        # After executing the tool, call the model again for a closing statement using the same active store.
-                        follow_tools = []
-                        follow_tool_resources = None
-                        if active_store_id:
-                            follow_tools.append({"type": "file_search"})
-                            follow_tool_resources = {"file_search": {"vector_store_ids": [active_store_id]}}
-                        follow_tools.extend(FUNCTION_TOOLS)
-
+                        # Ask the model to generate a closing statement after executing the tool
                         follow = await client.responses.create(
                             model="gpt-4o-mini",
                             input=[{"role": "system", "content": system}, *history[-24:]],
-                            tools=follow_tools,
-                            tool_resources=follow_tool_resources,
+                            tools=build_tools_for_user(""),
                             max_output_tokens=180,
                             temperature=0.2,
                         )
