@@ -296,36 +296,44 @@ POLICY_QUESTION_RE = re.compile(
 
 # Base function tools definitions.  These remain constant for each call and are
 # appended to the dynamic tools list built per user utterance.
+# Define function tools using the modern Responses API schema.  Each entry
+# must have a "type" of "function" and a nested "function" object with
+# name, description, and parameters fields.  See OpenAI Responses API docs
+# (Sept 2025) for details【552313873166555†screenshot】.
 FUNCTION_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
-        "name": "book_appointment",
-        "description": "Book a consultation appointment.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "iso_start": {"type": "string", "description": "Start datetime in ISO 8601 with timezone."},
-                "name": {"type": "string"},
-                "address": {"type": "string"},
-                "phone": {"type": "string"},
-                "duration_min": {"type": "integer", "default": 30},
-                "note": {"type": "string"},
+        "function": {
+            "name": "book_appointment",
+            "description": "Book a consultation appointment.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "iso_start": {"type": "string", "description": "Start datetime in ISO 8601 with timezone."},
+                    "name": {"type": "string"},
+                    "address": {"type": "string"},
+                    "phone": {"type": "string"},
+                    "duration_min": {"type": "integer", "default": 30},
+                    "note": {"type": "string"},
+                },
+                "required": ["iso_start", "name", "address"],
             },
-            "required": ["iso_start", "name", "address"],
         },
     },
     {
         "type": "function",
-        "name": "mark_opt_out",
-        "description": "Mark the caller as do‑not‑contact.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {"type": "string"},
-                "address": {"type": "string"},
-                "phone": {"type": "string"},
+        "function": {
+            "name": "mark_opt_out",
+            "description": "Mark the caller as do‑not‑contact.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "address": {"type": "string"},
+                    "phone": {"type": "string"},
+                },
+                "required": ["name"],
             },
-            "required": ["name"],
         },
     },
 ]
