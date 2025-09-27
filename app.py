@@ -296,10 +296,17 @@ POLICY_QUESTION_RE = re.compile(
 
 # Base function tools definitions.  These remain constant for each call and are
 # appended to the dynamic tools list built per user utterance.
-# Define function tools using the modern Responses API schema.  Each entry
-# must have a "type" of "function" and a nested "function" object with
-# name, description, and parameters fields.  See OpenAI Responses API docs
+# Define function tools for the Responses API.  Each entry must include
+# a top‑level "name", "description", and "parameters".  The newer nested
+# "function" schema does not apply to Responses as of Sept 2025—using it
+# causes missing parameter errors.  See OpenAI's file search and tool docs
 # (Sept 2025) for details【552313873166555†screenshot】.
+# Define function tools using the nested `function` schema.  For the
+# OpenAI Responses API (Sept 2025), each function tool must be represented
+# with a top‑level `type: "function"` and a nested `function` key
+# containing the name, description and parameters.  Failing to nest
+# the spec will result in an error about a missing `name` on the tool
+# entry (e.g. “tools[1].name” missing).  See the latest docs【552313873166555†screenshot】.
 FUNCTION_TOOLS: list[dict[str, object]] = [
     {
         "type": "function",
@@ -309,11 +316,17 @@ FUNCTION_TOOLS: list[dict[str, object]] = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "iso_start": {"type": "string", "description": "Start datetime in ISO 8601 with timezone."},
+                    "iso_start": {
+                        "type": "string",
+                        "description": "Start datetime in ISO 8601 with timezone."
+                    },
                     "name": {"type": "string"},
                     "address": {"type": "string"},
                     "phone": {"type": "string"},
-                    "duration_min": {"type": "integer", "default": 30},
+                    "duration_min": {
+                        "type": "integer",
+                        "default": 30
+                    },
                     "note": {"type": "string"},
                 },
                 "required": ["iso_start", "name", "address"],
