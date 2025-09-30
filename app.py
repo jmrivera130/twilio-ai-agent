@@ -394,13 +394,9 @@ def build_tools_for_user(user_text: str) -> list[dict]:
     tools: list[dict] = []
     if ids:
         tools.append({'type': 'file_search', 'vector_store_ids': ids})
-    try:
-        function_tools = _sanitize_function_tools(FUNCTION_TOOLS)
-    except Exception as e:
-        jsonlog.error('tools.sanitize_error', error=str(e))
-        raise
+    function_tools = _sanitize_function_tools(FUNCTION_TOOLS)
     tools.extend(function_tools)
-    jsonlog.info('tools.built', tools_preview=[{'type':t.get('type'),'name':(t.get('function') or {}).get('name')} for t in tools])
+    jsonlog.info('tools.built', tools_preview=[{'type':t.get('type'),'name':t.get('name')} for t in tools])
     _validate_tools(tools)
     return tools
 
@@ -518,7 +514,9 @@ async def relay(ws: WebSocket) -> None:
                 try:
                     response = await jsonlog.info('openai.call.begin');
             with section('openai.responses.create'):
-                client.responses.create(
+                tools = _harden_schemas(tools)
+jsonlog.info('tools.final', tools=tools)
+client.responses.create(
                         model="gpt-4o-mini",
                         input=[
                             {"role": "system", "content": system},
@@ -593,7 +591,9 @@ async def relay(ws: WebSocket) -> None:
                         # Ask the model to generate a closing statement after executing the tool
                         follow = await jsonlog.info('openai.call.begin');
             with section('openai.responses.create'):
-                client.responses.create(
+                tools = _harden_schemas(tools)
+jsonlog.info('tools.final', tools=tools)
+client.responses.create(
                             model="gpt-4o-mini",
                             input=[{"role": "system", "content": system}, *history[-24:]],
                             tools=build_tools_for_user(""),
@@ -638,14 +638,24 @@ async def relay(ws: WebSocket) -> None:
 def _sanitize_function_tools(raw_tools: list[dict]) -> list[dict]:
     out = []
     for i, t in enumerate(raw_tools or []):
-        if isinstance(t, dict) and t.get('type') == 'function' and isinstance(t.get('function'), dict):
+        if not isinstance(t, dict):
+            raise ValueError(f'function tool at index {i} is not a dict')
+        # Accept already-flat entries
+        if t.get('type') == 'function' and 'name' in t:
+            out.append(t)
+            continue
+        # Convert nested assistants-style to flat responses-style
+        if t.get('type') == 'function' and isinstance(t.get('function'), dict):
             fn = t['function']
             if 'name' not in fn:
                 raise ValueError(f"function tool at index {i} missing 'name'")
-            out.append(t)
+            flat = {'type':'function'}
+            flat.update({k:v for k,v in fn.items()})
+            out.append(flat)
             continue
-        if isinstance(t, dict) and 'name' in t and 'parameters' in t:
-            out.append({'type':'function','function': t})
+        # Convert bare function spec
+        if 'name' in t and 'parameters' in t:
+            out.append({'type':'function', **t})
             continue
         raise ValueError(f'invalid function tool at index {i}: {t}')
     return out
@@ -655,11 +665,20 @@ def _validate_tools(tools: list[dict]) -> None:
         raise ValueError('tools must be a list')
     for idx, item in enumerate(tools):
         if item.get('type') == 'function':
-            fn = item.get('function') or {}
-            if 'name' not in fn:
-                raise ValueError(f"tools[{idx}].name missing (inside 'function')")
+            if 'name' not in item:
+                raise ValueError(f"tools[{idx}].name missing (flattened schema)")
+            if 'parameters' not in item:
+                raise ValueError(f"tools[{idx}].parameters missing")
         elif item.get('type') == 'file_search':
             ids = item.get('vector_store_ids') or []
             if not ids:
                 raise ValueError('file_search tool missing vector_store_ids')
     jsonlog.info('tools.validated', count=len(tools))
+
+def _harden_schemas(tools: list[dict]) -> list[dict]:
+    for t in tools:
+        if t.get('type') == 'function':
+            params = t.get('parameters')
+            if isinstance(params, dict) and 'additionalProperties' not in params:
+                params['additionalProperties'] = False
+    return tools
