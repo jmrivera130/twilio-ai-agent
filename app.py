@@ -1,3 +1,30 @@
+import logging, time, traceback, os, json
+LOG_LEVEL = os.getenv('LOG_LEVEL','INFO').upper()
+logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format='%(message)s')
+class JsonLogger:
+    def __init__(self, name='app'):
+        self.log = logging.getLogger(name)
+    def _emit(self, level, event, **kw):
+        payload = {'level': level, 'event': event, 'ts': time.time()}
+        payload.update({k:v for k,v in kw.items() if v is not None})
+        self.log.log(getattr(logging, level, logging.INFO), json.dumps(payload, ensure_ascii=False))
+    def info(self, event, **kw): self._emit('INFO', event, **kw)
+    def warn(self, event, **kw): self._emit('WARNING', event, **kw)
+    def error(self, event, **kw): self._emit('ERROR', event, **kw)
+jsonlog = JsonLogger('chloe')
+from contextlib import contextmanager
+@contextmanager
+def section(name, **fields):
+    t0 = time.time()
+    jsonlog.info('section.start', name=name, **fields)
+    try:
+        yield
+        jsonlog.info('section.ok', name=name, ms=int((time.time()-t0)*1000))
+    except Exception as e:
+        tb = traceback.format_exc()
+        jsonlog.error('section.fail', name=name, error=str(e), traceback=tb, ms=int((time.time()-t0)*1000))
+        raise
+
 """
 Modern Twilio ConversationRelay → OpenAI Responses agent.
 
@@ -251,7 +278,7 @@ SYSTEM_EN = (
     "Politely ask whether they prefer to continue in English or Spanish, and keep the call in their chosen language. "
     # Empathy and brevity
     "Throughout the call, be empathetic and concise—keep replies to no more than two short sentences. "
-    "Internally, use the file_search tool to retrieve information when needed, but never mention documents, PDFs or citations to the caller. "
+    "Internally, use the file_search tool to retrieve information when needed, but never mention documents, PDFs, uploads, tools, or vector stores to the caller. "
     "Summarize information gently; if multiple alternatives exist, offer to discuss them one at a time or to schedule a consultation. "
     # Scheduling guidance
     "Only propose scheduling an appointment after the caller asks for next steps, expresses a desire to speak with someone, or confirms they want an appointment. "
@@ -273,7 +300,7 @@ SYSTEM_ES = (
     "Pregunta amablemente si prefiere continuar en inglés o español y mantén la llamada en el idioma elegido. "
     # Empatía y brevedad
     "A lo largo de la llamada, sé empática y concisa; no uses más de dos frases cortas por respuesta. "
-    "Internamente, utiliza la herramienta file_search para recuperar información cuando sea necesario, pero nunca menciones documentos, archivos PDF ni citas a la persona. "
+    "Internamente, utiliza la herramienta file_search para recuperar información cuando sea necesario, pero nunca menciones documentos, archivos PDF, cargas, herramientas ni almacenes vectoriales a la persona. "
     "Resume la información con suavidad; si existen varias alternativas, ofrécele tratarlas una por una o programar una consulta. "
     # Guía para agendar
     "Propón agendar una cita solo cuando la persona pida los siguientes pasos, exprese deseo de hablar con alguien o confirme que quiere una cita. "
@@ -363,16 +390,14 @@ def choose_vector_store(user_text: str) -> str:
     return VECTOR_STORE_CALLSCRIPTS_ID or VECTOR_STORE_POLICIES_ID
 
 def build_tools_for_user(user_text: str) -> list[dict]:
-    """Build a tools list for the Responses API call.
-
-    Prepend a file_search tool with the selected vector store ID (if any) to the list
-    of function tools. If no vector store ID is configured, omit the file_search tool.
-    """
-    vs_id = choose_vector_store(user_text)
+    ids = [i for i in [VECTOR_STORE_CALLSCRIPTS_ID, VECTOR_STORE_POLICIES_ID] if i]
     tools: list[dict] = []
-    if vs_id:
-        tools.append({"type": "file_search", "vector_store_ids": [vs_id]})
-    tools.extend(FUNCTION_TOOLS)
+    if ids:
+        tools.append({'type': 'file_search', 'vector_store_ids': ids})
+    function_tools = _sanitize_function_tools(FUNCTION_TOOLS)
+    tools.extend(function_tools)
+    jsonlog.info('tools.built', tools_preview=[{'type':t.get('type'),'name':t.get('name')} for t in tools])
+    _validate_tools(tools)
     return tools
 
 # Regular expressions for booking guard and language hints
@@ -384,6 +409,11 @@ SCHED_RE = re.compile(r"\b(book|schedule|appointment|set\s*up|consult|cita|agend
 async def send_text(ws: WebSocket, text: str) -> None:
     """Send a complete utterance to Twilio CR."""
     await ws.send_json({"type": "text", "token": text, "last": True})
+
+async def cr_send(ws: WebSocket, token: str, last: bool = False) -> None:
+    """Send a token frame to Twilio CR."""
+    await ws.send_json({"type": "text", "token": token, "last": last})
+
 
 def invites_booking_now(assistant_text: str, lang: str | None) -> bool:
     """Return True if assistant_text contains a booking invite in the given language."""
@@ -447,8 +477,12 @@ async def relay(ws: WebSocket) -> None:
             msg = await ws.receive_json()
             mtype = msg.get("type")
 
-            if mtype == "setup":
+            with section('ws.setup'):
+                if mtype == "setup":
                 caller_number = (msg.get("from") or "").strip() or None
+                # Instant greeting to hide model cold-start and offer language choice
+                await cr_send(ws, f"Hi, this is Chloe with {ORG_NAME}. ")
+                await cr_send(ws, "Would you like to continue in English or Spanish?", last=True)
                 continue
 
             if mtype == "prompt":
@@ -478,7 +512,11 @@ async def relay(ws: WebSocket) -> None:
                 # Append the user message to history and call the model
                 history.append({"role": "user", "content": user_text})
                 try:
-                    response = await client.responses.create(
+                    response = await jsonlog.info('openai.call.begin');
+            with section('openai.responses.create'):
+                tools = _harden_schemas(tools)
+jsonlog.info('tools.final', tools=tools)
+responses_create_normalized(client, 
                         model="gpt-4o-mini",
                         input=[
                             {"role": "system", "content": system},
@@ -551,7 +589,11 @@ async def relay(ws: WebSocket) -> None:
                         })
 
                         # Ask the model to generate a closing statement after executing the tool
-                        follow = await client.responses.create(
+                        follow = await jsonlog.info('openai.call.begin');
+            with section('openai.responses.create'):
+                tools = _harden_schemas(tools)
+jsonlog.info('tools.final', tools=tools)
+responses_create_normalized(client, 
                             model="gpt-4o-mini",
                             input=[{"role": "system", "content": system}, *history[-24:]],
                             tools=build_tools_for_user(""),
@@ -593,3 +635,87 @@ async def relay(ws: WebSocket) -> None:
             await ws.close()
         except Exception:
             pass
+def _sanitize_function_tools(raw_tools: list[dict]) -> list[dict]:
+    out = []
+    for i, t in enumerate(raw_tools or []):
+        if not isinstance(t, dict):
+            raise ValueError(f'function tool at index {i} is not a dict')
+        # Accept already-flat entries
+        if t.get('type') == 'function' and 'name' in t:
+            out.append(t)
+            continue
+        # Convert nested assistants-style to flat responses-style
+        if t.get('type') == 'function' and isinstance(t.get('function'), dict):
+            fn = t['function']
+            if 'name' not in fn:
+                raise ValueError(f"function tool at index {i} missing 'name'")
+            flat = {'type':'function'}
+            flat.update({k:v for k,v in fn.items()})
+            out.append(flat)
+            continue
+        # Convert bare function spec
+        if 'name' in t and 'parameters' in t:
+            out.append({'type':'function', **t})
+            continue
+        raise ValueError(f'invalid function tool at index {i}: {t}')
+    return out
+
+def _validate_tools(tools: list[dict]) -> None:
+    if not isinstance(tools, list):
+        raise ValueError('tools must be a list')
+    for idx, item in enumerate(tools):
+        if item.get('type') == 'function':
+            if 'name' not in item:
+                raise ValueError(f"tools[{idx}].name missing (flattened schema)")
+            if 'parameters' not in item:
+                raise ValueError(f"tools[{idx}].parameters missing")
+        elif item.get('type') == 'file_search':
+            ids = item.get('vector_store_ids') or []
+            if not ids:
+                raise ValueError('file_search tool missing vector_store_ids')
+    jsonlog.info('tools.validated', count=len(tools))
+
+def _harden_schemas(tools: list[dict]) -> list[dict]:
+    for t in tools:
+        if t.get('type') == 'function':
+            params = t.get('parameters')
+            if isinstance(params, dict) and 'additionalProperties' not in params:
+                params['additionalProperties'] = False
+    return tools
+
+
+def _ensure_responses_tools_kw(**kwargs):
+    t = kwargs.get("tools")
+    if t is None:
+        return kwargs
+    # Flatten function tools to Responses-style: {'type':'function','name':..., 'parameters': {...}}
+    flat = []
+    for i, item in enumerate(t):
+        if not isinstance(item, dict):
+            raise ValueError(f"tools[{i}] must be dict, got {type(item)}")
+        if item.get("type") == "function":
+            if "name" in item:
+                flat.append(item)  # already flat
+            elif isinstance(item.get("function"), dict):
+                fn = item["function"]
+                if "name" not in fn:
+                    raise ValueError(f"tools[{i}].name missing")
+                merged = {"type": "function"}
+                merged.update(fn)
+                flat.append(merged)
+            else:
+                raise ValueError(f"invalid function tool at {i}: {item}")
+        elif item.get("type") == "file_search":
+            ids = item.get("vector_store_ids") or []
+            if not ids:
+                raise ValueError("file_search tool missing vector_store_ids")
+            flat.append(item)
+        else:
+            flat.append(item)
+    kwargs["tools"] = flat
+    return kwargs
+
+def responses_create_normalized(client, **kwargs):
+    kwargs = _ensure_responses_tools_kw(**kwargs)
+    jsonlog.info("tools.final", tools=kwargs.get("tools"))
+    return responses_create_normalized(client, **kwargs)
