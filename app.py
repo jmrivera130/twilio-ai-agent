@@ -43,6 +43,7 @@ def section(name, **fields):
 # ---------------- env ----------------
 APP_VERSION = os.environ.get("APP_VERSION", "local")
 OPENAI_API_KEY = os.environ["OPENAI_API_KEY"]
+GIT_COMMIT = os.environ.get("GIT_COMMIT", "dev")
 RELAY_WSS_URL = os.environ["RELAY_WSS_URL"]
 ORG_NAME = os.environ.get("ORG_NAME", "Foreclosure Relief Group")
 BUSINESS_TZ = os.environ.get("TIMEZONE", "America/Los_Angeles")
@@ -51,7 +52,7 @@ VECTOR_STORE_CALLSCRIPTS_ID = (os.environ.get("VECTOR_STORE_CALLSCRIPTS_ID") or 
 VECTOR_STORE_POLICIES_ID = (os.environ.get("VECTOR_STORE_POLICIES_ID") or "").strip()
 
 print("=== NEW BUILD LOADED ===", flush=True)
-print(f"APP_VERSION={APP_VERSION}  RELAY_WSS_URL={RELAY_WSS_URL}  TZ={BUSINESS_TZ}", flush=True)
+print(f"APP_VERSION={APP_VERSION}  RELAY_WSS_URL={RELAY_WSS_URL}  TZ={BUSINESS_TZ}  GIT_COMMIT={GIT_COMMIT}", flush=True)
 
 TZ = ZoneInfo(BUSINESS_TZ)
 
@@ -63,6 +64,85 @@ ICS_DIR = BASE_DIR / "ics"; ICS_DIR.mkdir(parents=True, exist_ok=True)
 # ---------------- app & client ----------------
 app = FastAPI()
 client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# ---------------- redaction ----------------
+REDACT_PATTERNS = [r"(?i)\b(files?|uploads?|tools?|vector stores?|RAG)\b"]
+def redact_output(text: str) -> str:
+    if not text: return text
+    out = text
+    for pat in REDACT_PATTERNS:
+        out = re.sub(pat, "internal info", out)
+    return out.strip()
+
+# ---------------- tool execution & state ----------------
+def _safe_get(d, *keys, default=None):
+    cur = d
+    for k in keys:
+        if cur is None: return default
+        if isinstance(cur, dict):
+            cur = cur.get(k, None)
+        else:
+            cur = getattr(cur, k, None)
+    return cur if cur is not None else default
+
+def extract_tool_uses(resp) -> list[dict]:
+    uses = []
+    out = _safe_get(resp, "output", default=None)
+    if out and isinstance(out, (list, tuple)):
+        for item in out:
+            content = _safe_get(item, "content", default=[])
+            if isinstance(content, (list, tuple)):
+                for c in content:
+                    c_type = _safe_get(c, "type", default=None) or _safe_get(c, "item", default=None)
+                    name = _safe_get(c, "name", default=None)
+                    args = _safe_get(c, "input", default=None) or _safe_get(c, "arguments", default=None)
+                    if c_type in ("tool_use","tool_call") and name and isinstance(args, dict):
+                        uses.append({"name": name, "arguments": args})
+    tcalls = _safe_get(resp, "tool_calls", default=None) or _safe_get(resp, "choices", 0, "message", "tool_calls", default=None)
+    if tcalls and isinstance(tcalls, (list, tuple)):
+        for t in tcalls:
+            name = _safe_get(t, "function", "name", default=None) or _safe_get(t, "name", default=None)
+            argstr = _safe_get(t, "function", "arguments", default="{}")
+            try:
+                args = json.loads(argstr) if isinstance(argstr, str) else (argstr or {})
+            except Exception:
+                args = {}
+            if name and isinstance(args, dict):
+                uses.append({"name": name, "arguments": args})
+    return uses
+
+async def run_tools_if_any(ws, resp, caller_number: str | None):
+    tool_uses = extract_tool_uses(resp)
+    if not tool_uses:
+        return False
+    for call in tool_uses:
+        nm, args = call.get("name"), call.get("arguments", {})
+        if nm == "book_appointment":
+            with section("tool.book_appointment"):
+                try:
+                    args = dict(args)
+                    args.setdefault("duration_min", 30)
+                    rec = save_booking(args)
+                    jsonlog.info("booking.saved", record=rec, ics=str(ICS_DIR / f"{rec['id']}.ics"))
+                    dt = rec["start"].replace('T',' ')[:16]
+                    msg = f"Booked {rec['name']} on {dt}. I saved your appointment at {rec['address']}."
+                    await send_text(ws, msg)
+                except Exception as e:
+                    jsonlog.error("booking.error", error=str(e))
+                    await send_text(ws, "I had trouble saving that booking. Let’s try again.")
+        elif nm == "mark_opt_out":
+            with section("tool.mark_opt_out"):
+                try:
+                    args = dict(args)
+                    args.setdefault("phone", caller_number or "")
+                    rec = save_optout(args)
+                    jsonlog.info("optout.saved", record=rec)
+                    await send_text(ws, "Understood. I’ve marked you as do-not-contact.")
+                except Exception as e:
+                    jsonlog.error("optout.error", error=str(e))
+                    await send_text(ws, "I couldn’t record that just now. I’ll try again if you wish.")
+    return True
+
 
 # ---------------- helpers ----------------
 def _utc(dt: datetime) -> datetime:
@@ -182,6 +262,10 @@ def validate_tools_or_die(tools: list[dict]) -> None:
 async def index() -> PlainTextResponse:
     return PlainTextResponse("OK")
 
+@app.get("/version")
+async def version() -> JSONResponse:
+    return JSONResponse({"app_version": APP_VERSION, "git_commit": GIT_COMMIT})
+
 @app.post("/voice")
 async def voice(_: Request) -> PlainTextResponse:
     twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
@@ -267,8 +351,16 @@ async def relay(ws: WebSocket) -> None:
                     except Exception:
                         pass
                     text = text or "Could you say that again?"
-                    history.append({"role":"assistant","content":text})
-                    await send_text(ws, text)
+                    clean = redact_output(text)
+                    history.append({"role":"assistant","content":clean})
+                    await send_text(ws, clean)
+                    # run tools if any
+                    try:
+                        ran = await run_tools_if_any(ws, resp, caller_number)
+                        if ran:
+                            jsonlog.info("tools.executed", ok=True)
+                    except Exception as e:
+                        jsonlog.error("tools.exec.fail", error=str(e))
                 continue
 
             if mtype == "interrupt":
